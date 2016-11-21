@@ -193,82 +193,34 @@ module Roby
         #   to be executed by the engine
         attr_reader :once_blocks
 
-        # @api private
-        # 
-        # Internal structure used to store a poll block definition provided to
-        # #every or #add_propagation_handler
-        class PollBlockDefinition
-            ON_ERROR = [:raise, :ignore, :disable]
-
-            attr_reader :description
-            attr_reader :handler
-            attr_reader :on_error
-            attr_predicate :late?, true
-            attr_predicate :once?, true
-            attr_predicate :disabled?, true
-
-            def id; handler.object_id end
-
-            def initialize(description, handler, on_error: :raise, late: false, once: false)
-                if !PollBlockDefinition::ON_ERROR.include?(on_error.to_sym)
-                    raise ArgumentError, "invalid value '#{on_error} for the :on_error option. Accepted values are #{ON_ERROR.map(&:to_s).join(", ")}"
-                end
-
-                @description, @handler, @on_error, @late, @once =
-                    description, handler, on_error, late, once
-                @disabled = false
-            end
-        
-            def to_s; "#<PollBlockDefinition: #{description} #{handler} on_error:#{on_error}>" end
-
-            def call(engine, *args)
-                handler.call(*args)
-                true
-
-            rescue Exception => e
-                if on_error == :raise
-                    engine.add_framework_error(e, description)
-                    return false
-                elsif on_error == :disable
-                    ExecutionEngine.warn "propagation handler #{description} disabled because of the following error"
-                    Roby.log_exception_with_backtrace(e, ExecutionEngine, :warn)
-                    return false
-                elsif on_error == :ignore
-                    ExecutionEngine.warn "ignored error from propagation handler #{description}"
-                    Roby.log_exception_with_backtrace(e, ExecutionEngine, :warn)
-                    return true
-                end
-            end
-        end
-
         # Add/remove propagation handler methods that are shared between the
         # instance and the class
         module PropagationHandlerMethods
             # Code blocks that get called at the beginning of each cycle
             #
-            # @return [Array<PollBlockDefinition>]
+            # @return [Array<CallbackDefinition>]
             attr_reader :external_events_handlers
             # Code blocks that get called during propagation to handle some
             # internal propagation mechanism
             #
-            # @return [Array<PollBlockDefinition>]
+            # @return [Array<CallbackDefinition>]
             attr_reader :propagation_handlers
 
             # @api private
             #
             # Helper method that gets the arguments necessary top create a
             # propagation handler, sanitizes and normalizes them, and returns
-            # both the propagation type and the {PollBlockDefinition} object
+            # both the propagation type and the {CallbackDefinition} object
             #
             # @param [:external_events,:propagation] type whether the block should be registered as an
             #   :external_events block, processed at the beginning of the cycle,
             #   or a :propagation block, processed at each propagation loop.
             # @param [String] description a string describing the block. It will
             #   be used when adding timepoints to the event log
-            # @param poll_options (see PollBlockDefinition#initialize)
+            # @param poll_options (see CallbackDefinition#initialize)
             def create_propagation_handler(type: :external_events, description: 'propagation handler', **poll_options, &block)
                 check_arity block, 1
-                handler = PollBlockDefinition.new(description, block, **poll_options)
+                handler = CallbackDefinition.new(description, block, **poll_options)
 
                 if type == :external_events
                     if handler.late?
@@ -347,7 +299,7 @@ module Roby
 
         # Poll blocks that have been disabled because they raised an exception
         #
-        # @return [Array<PollBlockDefinition>]
+        # @return [Array<CallbackDefinition>]
         attr_reader :disabled_handlers
 
         def remove_propagation_handler(id)
@@ -714,7 +666,7 @@ module Roby
         end
 
         # Helper that calls the propagation handlers in +propagation_handlers+
-        # (which are expected to be instances of PollBlockDefinition) and
+        # (which are expected to be instances of CallbackDefinition) and
         # handles the errors according of each handler's policy
         def call_poll_blocks(blocks, late = false)
             blocks.delete_if do |handler|
@@ -1318,7 +1270,7 @@ module Roby
         # Schedules +block+ to be called once after +delay+ seconds passed, in
         # the propagation context
         def delayed(delay, description: 'delayed block', **options, &block)
-            handler = PollBlockDefinition.new(description, block, once: true, **options)
+            handler = CallbackDefinition.new(description, block, once: true, **options)
             once do
                 process_every << [handler, cycle_start, delay]
             end
@@ -1881,8 +1833,8 @@ module Roby
         #   it can be removed with {#remove_at_cycle_end}
         #
         # @yieldparam [Plan] plan the plan on which this engine runs
-        def at_cycle_end(description: 'at_cycle_end', &block)
-            handler = PollBlockDefinition.new(description, block, Hash.new)
+        def at_cycle_end(description: 'at_cycle_end', **options, &block)
+            handler = CallbackDefinition.new(description, block, **options)
             at_cycle_end_handlers << handler
             handler.object_id
         end
@@ -1903,7 +1855,7 @@ module Roby
         # The returned value is the periodic handler ID. It can be passed to
         # #remove_periodic_handler to undefine it.
         def every(duration, description: 'periodic handler', **options, &block)
-            handler = PollBlockDefinition.new(description, block, **options)
+            handler = CallbackDefinition.new(description, block, **options)
 
             once do
                 if handler.call(self, plan)
@@ -2310,7 +2262,7 @@ module Roby
         #
         # @return [Object] an ID that can be used as argument to {#remove_exception_listener}
 	def on_exception(description: 'exception listener', &block)
-            handler = PollBlockDefinition.new(description, block, on_error: :disable)
+            handler = CallbackDefinition.new(description, block, on_error: :disable)
 	    exception_listeners << handler
 	    handler
 	end

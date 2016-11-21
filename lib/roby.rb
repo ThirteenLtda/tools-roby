@@ -97,6 +97,8 @@ require 'roby/transactions'
 
 require 'roby/decision_control'
 require 'roby/schedulers/null'
+require 'rpby/callback_definition'
+require 'rpby/callback_manager'
 require 'roby/execution_engine'
 begin
     require 'gctools/oobgc'
