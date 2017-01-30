@@ -1,3 +1,4 @@
+ENV['PATH'] = "#{File.expand_path(File.join('..', '..', '..', 'bin'), __dir__)}:#{ENV['PATH']}"
 
 # simplecov must be loaded FIRST. Only the files required after it gets loaded
 # will be profiled !!!
