@@ -5,11 +5,14 @@ gem 'rubigen', git: 'https://github.com/doudou/rubigen'
 gem 'utilrb', git: 'https://github.com/orocos-toolchain/utilrb'
 gem 'metaruby', git: 'https://github.com/rock-core/tools-metaruby', branch: 'syskit2'
 
-platform :mri do
+platform :mri_21, :mri_22, :mri_23 do
     group 'development' do
         gem 'stackprof'
         gem 'rbtrace'
     end
+end
+
+platform :mri do
     group 'gui' do
         gem 'qtbindings'
     end

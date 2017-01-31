@@ -14,7 +14,16 @@ Rake::TestTask.new(:test) do |t|
     t.libs << "."
     t.libs << "lib"
     test_files = FileList['test/**/test_*.rb']
-    if !has_gui
+    begin
+        require 'stackprof'
+        require 'rbtrace'
+    rescue LoadError
+        test_files = test_files.exclude("test/app/test_debug.rb")
+    end
+
+    begin
+        require 'Qt'
+    rescue LoadError
         test_files = test_files.exclude("test/test_gui.rb")
     end
     t.test_files = test_files
