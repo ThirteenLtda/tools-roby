@@ -95,8 +95,9 @@ module Roby
                 it "registers the created paths for later cleanup" do
                     existing_dirs = app.created_log_dirs.to_set
                     app.find_and_create_log_dir('tag')
-                    assert_equal [File.dirname(app.log_base_dir), app.log_base_dir].to_set,
-                        app.created_log_base_dirs.to_set
+                    assert(([File.dirname(app.log_base_dir), app.log_base_dir].to_set ==
+                        app.created_log_base_dirs.to_set),
+                        "expected Set#{app.created_log_base_dirs.to_a} to equal Set[#{File.dirname(app.log_base_dir)}, #{app.log_base_dir}]")
                     assert_equal existing_dirs | Set[File.join(app.log_base_dir, 'tag')],
                         app.created_log_dirs.to_set
                 end
@@ -111,7 +112,7 @@ module Roby
                     existing_dirs = app.created_log_dirs.to_set
                     created = app.find_and_create_log_dir('tag')
                     assert_equal File.join(app.log_base_dir, 'tag.1'), created
-                    assert_equal [].to_set, app.created_log_base_dirs.to_set
+                    assert_equal [], app.created_log_base_dirs.to_a
                     assert_equal existing_dirs | Set[File.join(app.log_base_dir, 'tag.1')],
                         app.created_log_dirs.to_set
                 end
