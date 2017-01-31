@@ -28,6 +28,18 @@ class IO
     end
 end
 
+class Thread
+    if !method_defined?(:name)
+        def name=(name)
+            @name = name
+        end
+
+        def name
+            @name || to_s
+        end
+    end
+end
+
 class Object
     def inspect
         guard = (Thread.current[:ROBY_SUPPORT_INSPECT_RECURSION_GUARD] ||= Hash.new)
