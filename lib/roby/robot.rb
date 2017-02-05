@@ -49,8 +49,11 @@ module Robot
 	    raise ArgumentError, "wrong number of arguments (#{args.size} for 1) in #{name}!"
 	end
 
-	options = args.first || {}
-	task, planner = Roby.app.prepare_action(name, job_id: Roby::Interface::Job.allocate_job_id, **options)
+        options = args.first || Hash.new
+        if !options.has_key?(:job_id)
+            options[:job_id] = Roby::Interface::Job.allocate_job_id
+        end
+	task, planner = Roby.app.prepare_action(name, **options)
         task.plan.add_mission_task(task)
 	return task, planner
     end
