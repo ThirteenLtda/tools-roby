@@ -1,3 +1,4 @@
+require 'roby/app/installer'
 module Roby
     module Test
         # Helpers to test a full Roby app started as a subprocess
@@ -8,12 +9,13 @@ module Roby
                 @spawned_pids = Array.new
                 super
                 @app = Roby::Application.new
+                @app_dir = make_tmpdir
+                app.app_dir = app_dir
+                Installer.install(app, quiet: true)
                 app.public_logs = false
                 app.plugins_enabled = false
                 app.base_setup
                 register_plan(@app.plan)
-                @app_dir = make_tmpdir
-                app.app_dir = app_dir
             end
 
             def teardown

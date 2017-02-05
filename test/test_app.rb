@@ -18,25 +18,22 @@ module Roby
                     ENV.delete('ROBY_APP_DIR')
                 end
                 it "resolves the ROBY_APP_DIR environment variable if given" do
-                    Installer.install(app, quiet: true)
                     ENV['ROBY_APP_DIR'] = app_dir
                     assert_equal app_dir, Application.guess_app_dir
                 end
                 it "raises if ROBY_APP_DIR points to a directory that is not a valid Roby app" do
-                    ENV['ROBY_APP_DIR'] = app_dir
+                    ENV['ROBY_APP_DIR'] = make_tmpdir
                     assert_raises(Application::InvalidRobyAppDirEnv) do
                         Application.guess_app_dir
                     end
                 end
                 it "returns Dir.pwd if it is the root of a Roby application" do
-                    Installer.install(app, quiet: true)
                     FlexMock.use(Dir) do |mock|
                         mock.should_receive(:pwd).and_return(app_dir)
                         assert_equal app_dir, Application.guess_app_dir
                     end
                 end
                 it "looks for a roby application starting at the current working directory" do
-                    Installer.install(app, quiet: true)
                     FileUtils.mkdir_p(path = File.join(app_dir, 'test', 'path', 'in', 'app'))
                     FlexMock.use(Dir) do |mock|
                         mock.should_receive(:pwd).and_return(path)
@@ -44,9 +41,10 @@ module Roby
                     end
                 end
                 it "returns nil if Dir.pwd is not within a valid application " do
-                    FileUtils.mkdir_p(path = File.join(app_dir, 'test', 'path', 'in', 'app'))
+                    base_dir = make_tmpdir
+                    FileUtils.mkdir_p File.join(base_dir, 'test', 'path', 'in', 'app')
                     FlexMock.use(Dir) do |mock|
-                        mock.should_receive(:pwd).and_return(path)
+                        mock.should_receive(:pwd).and_return(base_dir)
                         assert_nil Application.guess_app_dir
                     end
                 end
@@ -93,11 +91,13 @@ module Roby
                 end
 
                 it "registers the created paths for later cleanup" do
+                    existing_base_dirs = app.created_log_base_dirs.to_set
                     existing_dirs = app.created_log_dirs.to_set
                     app.find_and_create_log_dir('tag')
-                    assert(([File.dirname(app.log_base_dir), app.log_base_dir].to_set ==
-                        app.created_log_base_dirs.to_set),
-                        "expected Set#{app.created_log_base_dirs.to_a} to equal Set[#{File.dirname(app.log_base_dir)}, #{app.log_base_dir}]")
+
+                    expected_dirs = existing_base_dirs | [File.dirname(app.log_base_dir), app.log_base_dir].to_set
+                    assert((expected_dirs == app.created_log_base_dirs.to_set),
+                       "expected Set#{app.created_log_base_dirs.to_a} to equal Set[#{expected_dirs.to_a}]")
                     assert_equal existing_dirs | Set[File.join(app.log_base_dir, 'tag')],
                         app.created_log_dirs.to_set
                 end
@@ -109,10 +109,11 @@ module Roby
                     flexmock(FileUtils).should_receive(:mkdir).
                         with(File.join(app.log_base_dir, 'tag.1')).
                         pass_thru
+                    existing_base_dirs = app.created_log_base_dirs.to_set
                     existing_dirs = app.created_log_dirs.to_set
                     created = app.find_and_create_log_dir('tag')
                     assert_equal File.join(app.log_base_dir, 'tag.1'), created
-                    assert_equal [], app.created_log_base_dirs.to_a
+                    assert_equal existing_base_dirs.to_set, app.created_log_base_dirs.to_set
                     assert_equal existing_dirs | Set[File.join(app.log_base_dir, 'tag.1')],
                         app.created_log_dirs.to_set
                 end
@@ -200,11 +201,12 @@ module Roby
 
                 describe "the backward-compatible behaviour" do
                     it "does not the robot name resolution to strict if config/robots is empty" do
-                        FileUtils.mkdir_p robots_dir
+                        FileUtils.rm_f File.join(robots_dir, 'default.rb')
                         app.setup_robot_names_from_config_dir
                         assert !app.robots.strict?
                     end
                     it "does not set the robot name resolution to strict if config/robots does not exist" do
+                        FileUtils.rm_rf File.join(robots_dir)
                         app.setup_robot_names_from_config_dir
                         assert !app.robots.strict?
                     end
