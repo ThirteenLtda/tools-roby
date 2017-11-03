@@ -5,7 +5,7 @@ require 'optparse'
 Robot.logger.level = Logger::WARN
 
 app = Roby.app
-app.require_app_dir
+app.guess_app_dir
 app.public_logs = false
 app.single = true
 app.simulation = true
