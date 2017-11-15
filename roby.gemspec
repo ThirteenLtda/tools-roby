@@ -38,7 +38,7 @@ Roby.
   s.add_runtime_dependency "yard"
   s.add_development_dependency "minitest", ">= 5.0", "~> 5.0"
   s.add_development_dependency "flexmock", "~> 2.0", ">= 2.0.3"
-  s.add_development_dependency "fakefs", '~> 0.6.0', ">= 0.6.7"
+  s.add_development_dependency "fakefs", '~> 0.11.0'
   s.add_development_dependency "timecop"
-  s.add_development_dependency "simplecov", '~> 0.11.0', '>= 0.11.1'
+  s.add_development_dependency "simplecov", '~> 0.15.0'
 end
