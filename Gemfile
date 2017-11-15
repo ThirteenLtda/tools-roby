@@ -12,6 +12,6 @@ platform :mri do
         gem 'qtbindings'
     end
 end
-gem 'coveralls'
+#gem 'coveralls'
 
 gemspec
