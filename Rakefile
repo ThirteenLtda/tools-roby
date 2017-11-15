@@ -27,9 +27,9 @@ Rake::TestTask.new(:test) do |t|
 end
 
 begin
-    require 'coveralls/rake/task'
-    Coveralls::RakeTask.new
-    task 'test:coveralls' => ['test', 'coveralls:push']
+    #require 'coveralls/rake/task'
+    #Coveralls::RakeTask.new
+    task 'test:coveralls'# => ['test', 'coveralls:push']
 rescue LoadError
 end
 
