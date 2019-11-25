@@ -85,7 +85,7 @@ module Roby
                 updates = Array.new
                 local_objects = groups.map do |collection|
                     collection.each_slice(2).map do |obj_id, marshalled_obj|
-                        proxy = marshalled_obj.proxy(self)
+                        proxy = local_object(marshalled_obj)
                         context_objects[obj_id] = proxy
 
                         if marshalled_obj.respond_to?(:remote_siblings)
@@ -115,7 +115,7 @@ module Roby
                 if droby_id = context_objects[object]
                     droby_id
                 elsif object.respond_to?(:droby_dump)
-                    if sibling = object_manager.known_sibling_on(object, peer_id)
+                    if sibling = object_manager.registered_sibling_on(object, peer_id)
                         RemoteDRobyID.new(peer_id, sibling)
                     else
                         object.droby_dump(self)
@@ -123,6 +123,14 @@ module Roby
                 else
                     object
                 end
+            end
+
+            def dump_model(object)
+                marshalled = dump(object)
+                if !marshalled.kind_of?(RemoteDRobyID) && object.respond_to?(:droby_dump)
+                    register_model(object)
+                end
+                marshalled
             end
 
             # Finds a local object that matches the object transmitted by
@@ -201,17 +209,17 @@ module Roby
             # It is first resolved among the 
             # models registered with {#register_model} and then resolved in
             # the process constant hierarchy
-            def find_local_model(marshalled)
+            def find_local_model(marshalled, name: marshalled.name)
                 resolved, local_model = find_local_object(marshalled)
                 if resolved
                     return local_model
-                elsif local_model = object_manager.find_model_by_name(marshalled.name)
+                elsif name && (local_model = object_manager.find_model_by_name(name))
                     return local_model
-                elsif !marshalled.name
+                elsif !name
                     return
                 end
 
-                names = marshalled.name.split('::')
+                names = name.split('::')
 
                 # Look locally for the constant listed in the name
                 local_object = Object
@@ -230,11 +238,22 @@ module Roby
                 model
             end
 
-            def register_model(local_model, known_siblings = Hash.new)
-                object_manager.register_model(local_model, known_siblings)
+            # (see ObjectManager#find_model_by_name)
+            def find_model_by_name(name)
+                object_manager.find_model_by_name(name)
             end
 
-            # Returns the set of siblings known for this object
+            # (see ObjectManager#register_object)
+            def register_object(object, known_siblings = Hash.new)
+                object_manager.register_object(object, known_siblings)
+            end
+
+            # (see ObjectManager#register_model)
+            def register_model(local_model, known_siblings = Hash.new, name: local_model.name)
+                object_manager.register_model(local_model, known_siblings, name: name)
+            end
+
+            # (see ObjectManager#known_siblings_for)
             def known_siblings_for(object)
                 object_manager.known_siblings_for(object)
             end

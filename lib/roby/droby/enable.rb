@@ -6,6 +6,7 @@ Exception.include Roby::DRoby::V5::Builtins::ExceptionDumper
 Array.include     Roby::DRoby::V5::Builtins::ArrayDumper
 Hash.include      Roby::DRoby::V5::Builtins::HashDumper
 Set.include       Roby::DRoby::V5::Builtins::SetDumper
+Thread.include    Roby::DRoby::Identifiable
 
 class Module
     def droby_dump(dest)
@@ -37,6 +38,9 @@ module Roby
         include DRoby::V5::ExecutionExceptionDumper
     end
     module Relations
+        class BidirectionalDirectedAdjacencyGraph
+            include DRoby::V5::BidirectionalGraphDumper
+        end
         class Graph
             extend DRoby::Identifiable
             extend DRoby::V5::DRobyConstant::Dump
@@ -74,6 +78,9 @@ module Roby
     class TaskEventGenerator
         include DRoby::V5::TaskEventGeneratorDumper
     end
+    class DefaultArgument
+        include DRoby::V5::DefaultArgumentDumper
+    end
     class DelayedArgumentFromObject
         extend DRoby::V5::Builtins::ClassDumper
         include DRoby::V5::DelayedArgumentFromObjectDumper
@@ -97,6 +104,14 @@ module Roby
                 class Argument
                     include DRoby::V5::Actions::Models::Action::ArgumentDumper
                 end
+            end
+
+            class MethodAction
+                include DRoby::V5::Actions::Models::MethodActionDumper
+            end
+
+            class CoordinationAction
+                include DRoby::V5::Actions::Models::CoordinationActionDumper
             end
         end
     end

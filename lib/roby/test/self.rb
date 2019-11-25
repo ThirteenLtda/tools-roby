@@ -1,16 +1,13 @@
 
 # simplecov must be loaded FIRST. Only the files required after it gets loaded
 # will be profiled !!!
-if ENV['TEST_ENABLE_COVERAGE'] == '1'
-    ENV['TEST_ENABLE_COVERAGE'] = '0'
+if ENV['TEST_ENABLE_COVERAGE'] == '1' || ENV['TEST_COVERAGE_MODE']
+    mode = ENV['TEST_COVERAGE_MODE'] || 'simplecov'
     begin
-        require 'simplecov'
-        SimpleCov.start do
-            add_filter "/test/"
-        end
-    rescue LoadError
+        require mode
+    rescue LoadError => e
         require 'roby'
-        Roby.warn "coverage is disabled because the 'simplecov' gem cannot be loaded"
+        Roby.warn "coverage is disabled because the code coverage gem cannot be loaded: #{e.message}"
     rescue Exception => e
         require 'roby'
         Roby.warn "coverage is disabled: #{e.message}"
@@ -21,7 +18,9 @@ require 'minitest/autorun'
 require 'flexmock/minitest'
 require 'roby'
 require 'roby/test/common'
+require 'roby/test/event_reporter'
 require 'roby/test/minitest_helpers'
+require 'roby/test/run_planners'
 require 'roby/tasks/simple'
 require 'roby/test/tasks/empty_task'
 
@@ -36,31 +35,37 @@ module Roby
     module Self
         include Roby::Test
         include Roby::Test::Assertions
+        include Test::RunPlanners
 
         def setup
+            @temp_dirs = Array.new
+
             Roby.app.log['server'] = false
             Roby.app.auto_load_models = false
             Roby.app.plugins_enabled = false
             Roby.app.testing = true
+            Roby.app.public_logs = false
+            Roby.app.log_base_dir = make_tmpdir
+            Roby.app.reset_log_dir
             Roby.app.setup
             Roby.app.prepare
 
-            @plan    = ExecutablePlan.new
+            @plan    = ExecutablePlan.new(event_logger: EventReporter.new(STDOUT))
             @control = DecisionControl.new
-            if !plan.execution_engine
-                ExecutionEngine.new(@plan, @control)
-            end
-
-            Roby.app.public_logs = false
 
             super
 
-	    # Save and restore some arrays
-	    save_collection Roby::ExecutionEngine.propagation_handlers
-	    save_collection Roby::ExecutionEngine.external_events_handlers
-	    save_collection Roby::Plan.structure_checks
-	    Roby.app.abort_on_exception = false
-	    Roby.app.abort_on_application_exception = true
+            # Save and restore some arrays
+            save_collection Roby::ExecutionEngine.propagation_handlers
+            save_collection Roby::ExecutionEngine.external_events_handlers
+            save_collection Roby::Plan.structure_checks
+            Roby.app.abort_on_exception = false
+            Roby.app.abort_on_application_exception = true
+        end
+
+        def enable_event_reporting(*filters)
+            plan.event_logger.enabled = true
+            filters.each { |f| plan.event_logger.filter(f) }
         end
 
         def teardown
@@ -69,21 +74,35 @@ module Roby
             rescue Exception => e
                 teardown_failure = e
             end
+            if execution_engine
+                execution_engine.shutdown
+            end
+            Roby.app.shutdown
             Roby.app.cleanup
             State.clear
             State.clear_model
             Conf.clear
             Conf.clear_model
 
+            @temp_dirs.each { |p| FileUtils.rm_rf(p) }
+
         ensure
             if teardown_failure
                 raise teardown_failure
             end
         end
+
+        def make_tmpdir
+            @temp_dirs << (dir = Dir.mktmpdir)
+            dir
+        end
     end
     end
     SelfTest = Test::Self
 end
+
+FlexMock.partials_are_based = true
+FlexMock.partials_verify_signatures = true
 
 module Minitest
     class Test

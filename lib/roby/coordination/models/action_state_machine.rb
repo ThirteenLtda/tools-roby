@@ -2,27 +2,6 @@ module Roby
     module Coordination
         module Models
 
-            # Exception raised in state machine definitions when a state is used
-            # in a transition, that cannot be reached in the first place
-            class UnreachableStateUsed < RuntimeError
-                # The set of unreachable states
-                attr_reader :states
-
-                def initialize(states)
-                    @states = states
-                end
-
-                def pretty_print(pp)
-                    pp.text "#{states.size} states are unreachable but used in transitions anyways"
-                    pp.nest(2) do
-                        pp.seplist(states) do |s|
-                            pp.breakable
-                            s.pretty_print(pp)
-                        end
-                    end
-                end
-            end
-
         # Definition of model-level functionality for action state machines
         #
         # In an action state machine, each state is represented by a single Roby
@@ -57,9 +36,9 @@ module Roby
         #       stand = state move(speed: 0)
         #       # This monitor triggers each time the system moves more than
         #       # 0.1 meters
-        #       d_monitor = task monitor_movement_threshold(d: 0.1) 
+        #       d_monitor = task monitor_movement_threshold(d: 0.1)
         #       # This monitor triggers after 20 seconds
-        #       t_monitor = task monitor_time_threshold(t: 20) 
+        #       t_monitor = task monitor_time_threshold(t: 20)
         #       # Make the distance monitor run in the move state
         #       move.depends_on d_monitor
         #       # Make the time monitor run in the stand state
@@ -84,9 +63,36 @@ module Roby
             # @return [Array<(Task,Event,Task)>]
             inherited_attribute(:transition, :transitions) { Array.new }
 
+            # (see Actions#toplevel_state?)
+            def toplevel_state?(state)
+                root == state ||
+                    starting_state == state ||
+                    transitions.any? { |from_state, _, to_state| from_state == state || to_state == state }
+            end
+
+            # @see (Base#map_task)
+            def map_tasks(mapping)
+                super
+
+                @starting_state = mapping[starting_state]
+                @transitions = transitions.map do |state, event, new_state|
+                    [mapping[state],
+                     mapping[event.task].find_event(event.symbol),
+                     mapping[new_state]]
+                end
+            end
+
+            def parse_names
+                super(Task => '_state', Capture => "")
+            end
+
             # Declares the starting state
             def start(state)
-                parse_task_names '_state'
+                parse_names
+                if @starting_state
+                    raise ArgumentError, "this state machine already has a starting "\
+                        "state, use #depends_on to run more than one task at startup"
+                end
                 @starting_state = validate_task(state)
             end
 
@@ -94,15 +100,48 @@ module Roby
                 task(object, task_model)
             end
 
+            # Capture the value of an event context
+            #
+            # The value returned by #capture is meant to be used as arguments to
+            # other states. This is a mechanism to pass information from one
+            # state to the next.
+            #
+            # @example determine the current heading and servo on it
+            #   measure_heading = state(self.measure_heading)
+            #   start(measure_heading)
+            #   current_heading = capture(measure_heading.success_event)
+            #   transition measure_heading.success_event, keep_heading(heading: current_heading)
+            #
+            def capture(state, event = nil, &block)
+                if !event
+                    state, event = state.task, state
+                end
+
+                if !toplevel_state?(state)
+                    raise ArgumentError, "#{state} is not a toplevel state, a capture's state must be toplevel"
+                elsif !event_active_in_state?(event, state)
+                    raise ArgumentError, "#{event} is not an event that is active in state #{state}"
+                end
+
+                filter =
+                    if block
+                        lambda(&block)
+                    else
+                        lambda { |ev| ev.context.first }
+                    end
+
+                capture = Capture.new(filter)
+                captures[capture] = [state, event]
+                capture
+            end
+
             # Returns the state for the given name, if found, nil otherwise
             #
             # @return Roby::Coordination::Models::TaskFromAction
-            def find_state_by_name(name)
-                find_task_by_name("#{name}_state")
-            end
+            def find_state_by_name(name) find_task_by_name("#{name}_state") end
 
-            def validate_task(object)
-                if !object.kind_of?(Coordination::Models::Task)
+            def validate_task(object) if
+                !object.kind_of?(Coordination::Models::Task)
                     raise ArgumentError, "expected a state object, got #{object}. States need to be created from e.g. actions by calling #state before they can be used in the state machine"
                 end
                 object
@@ -160,21 +199,28 @@ module Roby
             #   if the given event is emitted
             #
             def transition(*spec)
-                parse_task_names '_state'
+                parse_names
 
                 if spec.size == 2
                     state_event, new_state = *spec
-                    transition(state_event.task, state_event, validate_task(new_state))
+                    transition(state_event.task, state_event, new_state)
                 elsif spec.size != 3
                     raise ArgumentError, "expected 2 or 3 arguments, got #{spec.size}"
                 else
                     state, state_event, new_state = *spec
-                    transitions << [state, state_event, validate_task(new_state)]
+                    validate_task(state)
+                    validate_task(new_state)
+                    if !event_active_in_state?(state_event, state)
+                        raise EventNotActiveInState, "cannot transition on #{state_event} while in state #{state} as the event is not active in this state"
+                    end
+                    transitions << [state, state_event, new_state]
                 end
+            end
+
+            def to_s
+                "#{action_interface}.#{name}"
             end
         end
         end
     end
 end
-
-

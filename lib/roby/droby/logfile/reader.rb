@@ -11,8 +11,10 @@ module Roby
 
                 attr_reader :event_io
 
-                def initialize(event_io)
+                def initialize(event_io, index_path: nil)
                     @event_io = event_io
+                    @index_path = index_path ||
+                        event_io.path.gsub(/\.log$/, '') + ".idx"
                     event_io.rewind
                     options_hash = read_header
                     self.class.process_options_hash(options_hash)
@@ -53,7 +55,13 @@ module Roby
 
                 def load_one_cycle
                     if chunk = Logfile.read_one_chunk(event_io)
-                        ::Marshal.load_with_missing_constants(chunk)
+                        begin ::Marshal.load_with_missing_constants(chunk)
+                        rescue ArgumentError => e
+                            if e.message == "marshal data too short"
+                                raise TruncatedFileError, "marshal data invalid"
+                            else raise
+                            end
+                        end
                     end
                 rescue Exception => e
                     raise e, "#{e.message}, running roby-log repair might repair the file", e.backtrace
@@ -76,11 +84,11 @@ module Roby
                 #
                 # @return [String]
                 def index_path
-                    event_io.path.gsub(/\.log$/, '') + ".idx"
+                    @index_path
                 end
 
                 def rebuild_index(path = index_path)
-                    Logfile.warn "rebuilding index file for #{path}"
+                    Logfile.warn "rebuilding index file for #{event_io.path}"
                     File.open(path, 'w') do |index_io|
                         event_io = self.event_io.dup
                         Index.rebuild(File.open(event_io.path), index_io)
@@ -113,9 +121,9 @@ module Roby
                         @index = Index.read(path)
                     end
                 end
-                
-                def self.open(path)
-                    io = new(File.open(path))
+
+                def self.open(path, index_path: nil)
+                    io = new(File.open(path), index_path: index_path)
                     if block_given?
                         begin
                             yield(io)

@@ -24,7 +24,7 @@ module Roby
     # will return an Explanation instance where +elements+ ==
     # [pred.intermediate_event.last] (the Event instance that has been emitted).
     #
-    # However, if the event is not yet emitted then, 
+    # However, if the event is not yet emitted then,
     #
     #   pred.explain_false(task) => #<Explanation @elements=[pred.intermediate_event]>
     #
@@ -270,7 +270,7 @@ end
         # predicate, +elements+ the explanations for +predicate+ having reached
         # the value.
         #
-        # +elements+ is an array of Event and EventGenerator instances. 
+        # +elements+ is an array of Event and EventGenerator instances.
         #
         # If an Event is stored there, the explanation is that this event has
         # been emitted.
@@ -300,6 +300,8 @@ end
             def report_exceptions_on(e)
                 elements.each do |el|
                     case el
+                    when Explanation
+                        el.report_exceptions_on(e)
                     when Exception
                         e.report_exceptions_from(el)
                     when Event
@@ -314,7 +316,7 @@ end
                 end
             end
 
-            def pretty_print(pp)
+            def pretty_print(pp, context_task: nil)
                 if value == false
                     predicate.pretty_print(pp)
                     pp.text " is false"
@@ -332,35 +334,40 @@ end
                         pp.breakable
                         case explanation
                         when Event
-                            pp.text "the following event has been emitted "
+                            pp.text "the following event has been emitted:"
                         when EventGenerator
                             if value == nil
-                                pp.text "the following event is unreachable "
+                                pp.text "the following event is unreachable:"
                             elsif value == true
-                                pp.text "the following event is reachable, but has not been emitted "
+                                pp.text "the following event is reachable, but has not been emitted:"
                             else
-                                pp.text "the following event has been emitted "
+                                pp.text "the following event has been emitted:"
                             end
                         end
 
-                        explanation.pretty_print(pp)
+                        pp.breakable
+                        explanation.pretty_print(
+                            pp, context_task: context_task)
                         case explanation
                         when Event
                             sources = explanation.all_sources
                             if !sources.empty?
                                 pp.breakable
+                                pp.breakable
                                 pp.text "The emission was caused by the following events"
                                 sources.each do |ev|
                                     pp.breakable
                                     pp.text "< "
-                                    ev.pretty_print(pp, false)
+                                    ev.pretty_print(pp,
+                                        context: false, context_task: context_task)
                                 end
                             end
 
                         when EventGenerator
                             if value == nil && explanation.unreachability_reason
                                 pp.breakable
-                                pp.text "The unreachability was caused by "
+                                pp.breakable
+                                pp.text "The unreachability was caused by"
                                 pp.nest(2) do
                                     pp.breakable
                                     explanation.unreachability_reason.pretty_print(pp)
@@ -369,7 +376,6 @@ end
                         else
                             explanation.pretty_print(pp)
                         end
-                        pp.breakable
                     end
                 end
             end
@@ -774,7 +780,11 @@ end
 
             # Code generation to create the overall evaluated predicate
             def code
-                "!!task_#{event_name}"
+                if @deadline
+                    return "task_#{event_name} && (task_#{event_name}.time.to_f > #{@deadline.to_f})"
+                else
+                    "!!task_#{event_name}"
+                end
             end
 
             # Returns an Explanation object that explains why +self+ is true.
@@ -802,11 +812,16 @@ end
             end
             def static?(task)
                 event = task.event(event_name)
-                event.emitted? || event.unreachable?
+                evaluate(task) || event.unreachable?
             end
 
             def never
                 Never.new(self)
+            end
+
+            def from_now
+                @deadline = Time.now
+                self
             end
 
             def not_followed_by(event)
@@ -821,4 +836,3 @@ end
         end
     end
 end
-

@@ -3,6 +3,7 @@ module Roby
         module PlanObject
             include MetaRuby::ModelAsClass
             extend MetaRuby::Attributes
+            include Transaction::Proxying::Cache
 
             # @return [Array<UnboundMethod>] set of finalization handlers
             #   defined at the model level
@@ -70,6 +71,11 @@ module Roby
                 private :plan=
                 private :executable=
                 EOD
+            end
+
+            # Create a {Queries::PlanObjectMatcher}
+            def match
+                Queries::PlanObjectMatcher.new.with_model(self)
             end
         end
     end

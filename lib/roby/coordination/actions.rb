@@ -3,8 +3,8 @@ module Roby
         # Common functionality of coordination models that manipulate actions
         # (ActionStateMachine, ActionScript)
         class Actions < Base
-            # The action interface model that is supporting self
-            attr_reader :action_interface_model
+            extend Models::Actions
+
             # @return [Coordination::Task] the currently active toplevel task
             attr_reader :current_task
 
@@ -14,10 +14,21 @@ module Roby
             # forwards that are defined for it
             attr_reader :task_info
 
-            def initialize(action_interface_model, root_task, arguments = Hash.new)
+            # Resolved captures
+            #
+            # This is currently only used by the {ActionStateMachine}
+            #
+            # @return [Hash<Models::Capture, Object>]
+            attr_reader :resolved_captures
+
+            def initialize(root_task, arguments = Hash.new)
                 super(root_task, arguments)
-                @action_interface_model = action_interface_model
                 @task_info = resolve_task_info
+                @resolved_captures = Hash.new
+            end
+
+            def action_interface_model
+                model.action_interface
             end
 
             def task_info_for(task)
@@ -54,14 +65,16 @@ module Roby
                     remove_when_done: true]
             end
 
-            def start_task(toplevel)
+            def start_task(toplevel, explicit_start: false)
                 task_info = self.task_info[toplevel]
                 tasks, forwards = task_info.required_tasks, task_info.forwards
+                variables = arguments.merge(resolved_captures)
+
                 instanciated_tasks = tasks.map do |task, roles|
-                    action_task = task.model.instanciate(root_task.plan, arguments)
+                    action_task = task.model.instanciate(root_task.plan, variables)
                     root_task.depends_on(action_task, dependency_options_for(toplevel, task, roles))
                     bind_coordination_task_to_instance(task, action_task, on_replace: :copy)
-                    task.model.setup_instanciated_task(self, action_task, arguments)
+                    task.model.setup_instanciated_task(self, action_task, variables)
                     action_task
                 end
 
@@ -69,7 +82,7 @@ module Roby
                 forwards.each do |source, target|
                     source.resolve.on do |event|
                         if target.resolve.task.running?
-                            target.resolve.emit
+                            target.resolve.emit(*event.context)
                         end
                     end
                 end
@@ -79,9 +92,12 @@ module Roby
 
             def remove_current_task
                 current_task_child = root_task.find_child_from_role('current_task')
-                task_info[current_task].required_tasks.each do |_, roles|
-                    if child_task = root_task.find_child_from_role(roles.first)
-                        root_task.remove_dependency(child_task)
+                task_info[current_task].required_tasks.each do |task, roles|
+                    if state_name = task.name
+                        roles = [state_name, *roles]
+                    end
+                    if !roles.empty? && (child_task = root_task.find_child_from_role(roles.first))
+                        root_task.remove_roles(child_task, *roles)
                     end
                 end
             end

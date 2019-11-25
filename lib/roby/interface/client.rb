@@ -22,11 +22,22 @@ module Roby
             #   integer is an ID that can be used to refer to the exception.
             #   It is always growing and will never collide with a notification ID
             attr_reader :exception_queue
+            # @return [Array<Integer,Array>] list of queued UI events. The
+            #   integer is an ID that can be used to refer to the exception.
+            #   It is always growing and will never collide with a notification ID
+            attr_reader :ui_event_queue
 
             # @return [Integer] index of the last processed cycle
             attr_reader :cycle_index
             # @return [Time] time of the last processed cycle
             attr_reader :cycle_start_time
+            # @return [Array<Hash>] list of the pending async calls
+            attr_reader :pending_async_calls
+
+            # Result of the calls done during the handshake
+            #
+            # @return [Hash<Symbol,Object>]
+            attr_reader :handshake_results
 
             # Create a client endpoint to a Roby interface [Server]
             #
@@ -34,16 +45,24 @@ module Roby
             # @param [String] id a unique identifier for this client
             #   (e.g. host:port of the local endpoint when using TCP). It is
             #   passed to the server through {Server#handshake}
+            # @param [Array<Symbol>] handshake commands executed on the server side
+            #   during the handshake and stored in the {handshake_results} attribute.
+            #   Include :actions and :commands if you pass this explicitely, unless
+            #   you know what you are doing
             #
             # @see Interface.connect_with_tcp_to
-            def initialize(io, id)
+            def initialize(io, id, handshake: [:actions, :commands])
+                @pending_async_calls = Array.new
                 @io = io
                 @message_id = 0
                 @notification_queue = Array.new
                 @job_progress_queue = Array.new
                 @exception_queue = Array.new
+                @ui_event_queue = Array.new
 
-                @actions, @commands = handshake(id)
+                @handshake_results = call([], :handshake, id, handshake)
+                @actions  = @handshake_results[:actions]
+                @commands = @handshake_results[:commands]
             end
 
             # Whether the communication channel to the server is closed
@@ -98,20 +117,48 @@ module Roby
                 end
 
                 if m == :bad_call
-                    e = args.first
-                    raise e, e.message, e.backtrace
+                    if !pending_async_calls.empty?
+                        process_pending_async_call(args.first, nil)
+                    else
+                        e = args.first
+                        raise e, e.message, (e.backtrace + caller)
+                    end
                 elsif m == :reply
-                    yield args.first
+                    if !pending_async_calls.empty?
+                        process_pending_async_call(nil, args.first)
+                    else
+                        yield args.first
+                    end
                 elsif m == :job_progress
                     queue_job_progress(*args)
                 elsif m == :notification
                     queue_notification(*args)
+                elsif m == :ui_event
+                    queue_ui_event(*args)
                 elsif m == :exception
                     queue_exception(*args)
                 else
                     raise ProtocolError, "unexpected reply from #{io}: #{m} (#{args.map(&:to_s).join(",")})"
                 end
                 false
+            end
+
+            # Wait until there is data to process on the IO channel
+            #
+            # @param [Numeric,nil] timeout a timeout after which the method
+            #   will return. Use nil for no timeout
+            # @return [Boolean] falsy if the timeout was reached, true
+            #   otherwise
+            def wait(timeout: nil)
+                io.read_wait(timeout: timeout)
+            end
+
+            # @api private
+            #
+            # Remove and call the block of a pending async call
+            def process_pending_async_call(error, result)
+                current_call = pending_async_calls.shift
+                current_call[:block].call(error, result)
             end
 
             # Polls for new data on the IO channel
@@ -130,7 +177,7 @@ module Roby
                 while packet = io.read_packet(timeout)
                     has_cycle_end = process_packet(*packet) do |reply_value|
                         if result
-                            raise ProtocolError, "got more than one reply in a single poll call"
+                            raise ProtocolError, "got more than one sync reply in a single poll call"
                         end
                         result = reply_value
                         expected_count -= 1
@@ -194,6 +241,23 @@ module Roby
             #   by (Application#notify)
             def pop_notification
                 notification_queue.shift
+            end
+
+            # @api private
+            #
+            # Push a UI event to {#ui_event_queue}
+            def queue_ui_event(event_name, *args)
+                ui_event_queue.push [allocate_message_id, [event_name, *args]]
+            end
+
+            # Whether some UI events have been queued
+            def has_ui_event?
+                !ui_event_queue.empty?
+            end
+
+            # Remove the oldest UI event and return it
+            def pop_ui_event
+                ui_event_queue.shift
             end
 
             # @api private
@@ -263,6 +327,43 @@ module Roby
 
             # @api private
             #
+            # Asynchronously call a method on the interface or on one of the
+            # interface's subcommands
+            #
+            # @param [Array<String>] path path to the subcommand. Empty means on
+            #   the interface object itself.
+            # @param [Symbol] m command or action name. Actions are always
+            #   formatted as action_name!
+            # @param [Object] args the command or action arguments
+            # @return [Object] an Object associated with the call @see async_call_pending?
+            def async_call(path, m, *args, &block)
+                raise RuntimeError, "no callback block given" unless block_given?
+                if m.to_s =~ /(.*)!$/
+                    action_name = $1
+                    if find_action_by_name(action_name)
+                        path = []
+                        m = :start_job
+                        args = [action_name, *args]
+                    else raise NoSuchAction, "there is no action called #{action_name} on #{self}"
+                    end
+                end
+                io.write_packet([path, m, *args])
+                pending_async_calls << { block: block, path: path, m: m, args: args }
+                pending_async_calls.last.freeze
+            end
+
+            # @api private
+            #
+            # Whether the async call is still pending
+            # @param [Object] call the Object associated with the call
+            # @return [Boolean] true if the async call is pending,
+            #   false otherwise
+            def async_call_pending?(a_call)
+                pending_async_calls.any? { |item| item.equal?(a_call) }
+            end
+
+            # @api private
+            #
             # Object used to gather commands in a batch
             #
             # @see Client#create_batch Client#process_batch
@@ -273,6 +374,10 @@ module Roby
                 def initialize(context)
                     @context = context
                     @calls = ::Array.new
+                end
+
+                def empty?
+                    @calls.empty?
                 end
 
                 # The set of operations that have been gathered so far
@@ -298,6 +403,13 @@ module Roby
                     end
                 end
 
+                # Drop the given job within the batch
+                #
+                # Note that as all batch operations, order does NOT matter
+                def drop_job(job_id)
+                    __push([], :drop_job, job_id)
+                end
+
                 # Kill the given job within the batch
                 #
                 # Note that as all batch operations, order does NOT matter
@@ -305,11 +417,15 @@ module Roby
                     __push([], :kill_job, job_id)
                 end
 
+                def respond_to_missing?(m, include_private)
+                    (m =~ /(.*)!$/) || super
+                end
+
                 # @api private
                 #
                 # Provides the action_name! syntax to start jobs
                 def method_missing(m, *args)
-                    if m.to_s =~ /(.*)!$/
+                    if m =~ /(.*)!$/
                         start_job($1, *args)
                     else
                         ::Kernel.raise ::NoMethodError.new(m), "#{m} either does not exist, or is not supported in batch context (only starting and killing jobs is)"
@@ -320,6 +436,88 @@ module Roby
                 # the calls in {#__calls}
                 def __process
                     @context.process_batch(self)
+                end
+
+                class Return
+                    include Enumerable
+
+                    Element = Struct.new :call, :return_value
+
+                    def self.from_calls_and_return(calls, return_values)
+                        elements = calls.zip(return_values).map do |c, r|
+                            Element.new(c, r)
+                        end
+                        new(elements)
+                    end
+
+                    def initialize(elements)
+                        @elements = elements
+                    end
+
+                    def each(&block)
+                        return enum_for(__method__) if !block_given?
+                        @elements.each { |e| yield(e.return_value) }
+                    end
+
+                    def each_element(&block)
+                        @elements.each(&block)
+                    end
+
+                    def [](index)
+                        @elements[index].return_value
+                    end
+
+                    def call_at(index)
+                        @elements[index].call
+                    end
+
+                    def return_value_at(index)
+                        @elements[index].return_value
+                    end
+
+                    def filter(call: nil)
+                        filtered = @elements.find_all do |e|
+                            e.call[1] == call
+                        end
+                        Return.new(filtered)
+                    end
+
+                    def started_jobs_id
+                        filter(call: :start_job).to_a
+                    end
+
+                    def killed_jobs_id
+                        filter(call: :kill_job).each_element.
+                            map { |e| e.call[2] }
+                    end
+
+                    def dropped_jobs_id
+                        filter(call: :drop_job).each_element.
+                            map { |e| e.call[2] }
+                    end
+                end
+            end
+
+            Job = Struct.new :job_id, :state, :placeholder_task, :task do
+                def action_model
+                    task.action_model
+                end
+            end
+
+            # Enumerate the current jobs
+            def each_job
+                return enum_for(__method__) if !block_given?
+                jobs.each do |job_id, (job_state, placeholder_task, job_task)|
+                    yield(Job.new(job_id, job_state, placeholder_task, job_task))
+                end
+            end
+
+            # Find all the jobs that match the given action name
+            #
+            # @return [Array<Job>]
+            def find_all_jobs_by_action_name(action_name)
+                each_job.find_all do |j|
+                    j.action_model.name == action_name
                 end
             end
 
@@ -341,7 +539,8 @@ module Roby
             # @return [Array] the return values of each of the calls gathered in
             #   the batch
             def process_batch(batch)
-                call([], :process_batch, batch.__calls)
+                ret = call([], :process_batch, batch.__calls)
+                BatchContext::Return.from_calls_and_return(batch.__calls, ret)
             end
 
             def reload_actions
@@ -352,10 +551,28 @@ module Roby
                 commands[name]
             end
 
-            def method_missing(m, *args)
-                call([], m, *args)
+            # Tests whether the remote interface has a given subcommand
+            def has_subcommand?(name)
+                commands.has_key?(name)
+            end
+
+            # Returns a shell object
+            def subcommand(name)
+                if !(sub = find_subcommand_by_name(name))
+                    raise ArgumentError, "#{name} is not a known subcommand on #{self}"
+                end
+                SubcommandClient.new(self, name, sub.description, sub.commands)
+            end
+
+            def method_missing(m, *args, &block)
+                if sub = find_subcommand_by_name(m.to_s)
+                    SubcommandClient.new(self, m.to_s, sub.description, sub.commands)
+                elsif (match = /^async_(.*)$/.match(m.to_s))
+                    async_call([], match[1].to_sym, *args, &block)
+                else
+                    call([], m, *args)
+                end
             end
         end
     end
 end
-

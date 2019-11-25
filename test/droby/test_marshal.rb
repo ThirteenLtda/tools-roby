@@ -7,6 +7,8 @@ module Roby
 
         class IdentifiableObject
             include Identifiable
+            # To please flexmock strict mode
+            def droby_dump(peer); raise NotImplementedError end
         end
 
         describe Marshal do
@@ -158,6 +160,7 @@ module Roby
             describe "#find_local_model" do
                 let(:marshalled) { flexmock }
                 it "resolves it as an object first" do
+                    marshalled.should_receive(name: 'Test')
                     flexmock(subject).should_receive(:find_local_object).with(marshalled).
                         and_return([true, obj = flexmock])
                     assert_equal obj, subject.find_local_model(marshalled)
@@ -168,6 +171,15 @@ module Roby
                         and_return([false, nil])
                     model = flexmock(name: 'Test', droby_id: Object.new)
                     subject.object_manager.register_model(model)
+                    marshalled.should_receive(name: 'Test')
+                    assert_equal model, subject.find_local_model(marshalled, name: 'Test')
+                end
+
+                it "accepts an explicit name" do
+                    flexmock(subject).should_receive(:find_local_object).with(marshalled).
+                        and_return([false, nil])
+                    model = flexmock(droby_id: Object.new)
+                    subject.object_manager.register_model(model, name: 'Test')
                     marshalled.should_receive(name: 'Test')
                     assert_equal model, subject.find_local_model(marshalled)
                 end
@@ -183,7 +195,7 @@ module Roby
                     flexmock(subject).should_receive(:find_local_object).
                         and_return([false, nil])
                     marshalled.should_receive(name: 'Roby::Does::Not::Exist')
-                    assert_equal nil, subject.find_local_model(marshalled)
+                    assert_nil subject.find_local_model(marshalled)
                 end
             end
 

@@ -10,14 +10,13 @@ module Roby
             # @return [Client,nil] the socket used to communicate to the server,
             #   or nil if we have not managed to connect yet
             attr_reader :client
-            # @return [Mutex] the shell requires multi-threading access, this is
-            #   the mutex to protect when required
-            attr_reader :mutex
+
+            attr_predicate :silent?, false
 
             def initialize(remote_name, &connection_method)
                 @connection_method = connection_method
                 @remote_name = remote_name
-                @mutex = Mutex.new
+                @silent = false
                 connect
             end
 
@@ -27,6 +26,8 @@ module Roby
                 retry_warning = false
                 begin
                     @client = connection_method.call
+                    @batch = client.create_batch
+                    @batch_job_info = Hash.new
                 rescue ConnectionError, ComError => e
                     if retry_period
                         if e.kind_of?(ComError)
@@ -42,8 +43,13 @@ module Roby
                 end
             end
 
+            def closed?
+                client.closed?
+            end
+
             def close
                 client.close
+                @job_manager = nil
                 @client = nil
             end
 
@@ -100,16 +106,24 @@ module Roby
                 end.join(", ")
             end
 
+            def __jobs
+                call Hash[retry: true], [], :jobs
+            end
+
             def jobs
-                jobs = call Hash[retry: true], [], :jobs
-                jobs.each do |id, (state, task, planning_task)|
-                    if planning_task.respond_to?(:action_model) && planning_task.action_model
-                        name = "#{planning_task.action_model.to_s}(#{format_arguments(planning_task.action_arguments)})"
-                    else name = task.to_s
-                    end
-                    puts "[%4d] (%s) %s" % [id, state.to_s, name]
+                jobs = __jobs
+                jobs.each do |id, job_info|
+                    puts format_job_info(id, *job_info)
                 end
                 nil
+            end
+
+            def format_job_info(id, state, task, planning_task)
+                if planning_task.respond_to?(:action_model) && planning_task.action_model
+                    name = "#{planning_task.action_model.to_s}(#{format_arguments(planning_task.action_arguments)})"
+                else name = task.to_s
+                end
+                "[%4d] (%s) %s" % [id, state.to_s, name]
             end
 
             def retry_on_com_error
@@ -123,7 +137,7 @@ module Roby
             def describe(matcher)
                 if matcher.kind_of?(Roby::Actions::Action)
                     pp matcher.model
-                elsif matcher.kind_of?(Roby::Actions::Model::Action)
+                elsif matcher.kind_of?(Roby::Actions::Models::Action)
                     pp matcher
                 else
                     client.find_all_actions_matching(matcher).each do |act|
@@ -141,9 +155,7 @@ module Roby
                         return call options, path, m, *args
                     end
                 else
-                    @mutex.synchronize do
-                        client.call(path, m, *args)
-                    end
+                    client.call(path, m, *args)
                 end
             rescue Exception => e
                 msg = Roby.format_exception(e)
@@ -194,35 +206,117 @@ module Roby
 
             def wtf?
                 msg = []
-                @mutex.synchronize do
-                    client.notification_queue.each do |id, level, message|
-                        msg << Roby.color("-- ##{id} (notification) --", :bold)
-                        msg.concat format_message(kind, level, message)
-                        msg << "\n"
-                    end
-                    client.job_progress_queue.each do |id, (kind, job_id, job_name, *args)|
-                        msg << Roby.color("-- ##{id} (job progress) --", :bold)
-                        msg.concat format_job_progress(kind, job_id, job_name, *args)
-                        msg << "\n"
-                    end
-                    client.exception_queue.each do |id, (kind, exception, tasks)|
-                        msg << Roby.color("-- ##{id} (#{kind} exception) --", :bold)
-                        msg.concat format_exception(kind, exception, tasks)
-                        msg << "\n"
-                    end
-                    client.job_progress_queue.clear
-                    client.exception_queue.clear
-                    client.notification_queue.clear
+                client.notification_queue.each do |id, (source, level, message)|
+                    msg << Roby.color("-- ##{id} (notification) --", :bold)
+                    msg.concat format_notification(source, level, message)
+                    msg << "\n"
                 end
+                client.job_progress_queue.each do |id, (kind, job_id, job_name, *args)|
+                    msg << Roby.color("-- ##{id} (job progress) --", :bold)
+                    msg.concat format_job_progress(kind, job_id, job_name, *args)
+                    msg << "\n"
+                end
+                client.exception_queue.each do |id, (kind, exception, tasks)|
+                    msg << Roby.color("-- ##{id} (#{kind} exception) --", :bold)
+                    msg.concat format_exception(kind, exception, tasks)
+                    msg << "\n"
+                end
+                client.job_progress_queue.clear
+                client.exception_queue.clear
+                client.notification_queue.clear
                 puts msg.join("\n")
                 nil
             end
 
-            def method_missing(m, *args, &block)
+            def safe?
+                !!@batch
+            end
+
+            def safe
+                @batch ||= client.create_batch
+                nil
+            end
+
+            def unsafe
+                @batch = nil
+            end
+
+            def resolve_job_id(job_id)
+                if job_info = __jobs[job_id]
+                    job_info
+                else
+                    STDERR.puts Roby.color("No job #{job_id}", :bold, :bright_red)
+                end
+            end
+
+            def kill_job(job_id)
+                if safe?
+                    if @batch_job_info[job_id] = resolve_job_id(job_id)
+                        @batch.kill_job job_id
+                        review
+                    end
+                else
+                    super
+                end
+                nil
+            end
+
+            def drop_job(job_id)
+                if safe?
+                    if @batch_job_info[job_id] = resolve_job_id(job_id)
+                        @batch.drop_job job_id
+                        review
+                    end
+                else
+                    super
+                end
+                nil
+            end
+
+            def review
+                if safe?
+                    puts "#{@batch.__calls.size} actions queued in the current batch, use #process to send, #cancel to delete"
+                    @batch.__calls.each do |context, m, *args|
+                        if m == :drop_job || m == :kill_job
+                            job_id = args.first
+                            job_info = format_job_info(job_id, *@batch_job_info[job_id])
+                            puts "#{Roby.color(m.to_s, :bold, :bright_red)} #{job_info}"
+                        elsif m == :start_job
+                            puts "#{Roby.color("#{args[0]}!", :bright_blue)}(#{args[1]})"
+                        else
+                            puts "#{Roby.color("#{m}!", :bright_blue)}(#{args.first})"
+                        end
+                    end
+                end
+                nil
+            end
+
+            def process
+                if safe?
+                    @batch.__process
+                else
+                    STDERR.puts "Not in batch context"
+                end
+                @batch = client.create_batch
+                nil
+            end
+
+            def cancel
+                @batch = client.create_batch
+                review
+                nil
+            end
+
+            def method_missing(m, *args)
                 if sub = client.find_subcommand_by_name(m.to_s)
                     ShellSubcommand.new(self, m.to_s, sub.description, sub.commands)
                 elsif act = client.find_action_by_name(m.to_s)
                     Roby::Actions::Action.new(act, *args)
+                elsif @batch && m.to_s =~ /(.*)!$/
+                    action_name = $1
+                    @batch.start_job(action_name, *args)
+                    review
+                    nil
                 else
                     begin
                         call Hash[], [], m, *args
@@ -240,14 +334,24 @@ module Roby
                 end
             rescue ComError
                 Roby::Interface.warn "Lost communication with remote, will not retry the command after reconnection"
-                mutex.synchronize do
-                    connect
-                end
+                connect
             rescue Interrupt
                 Roby::Interface.warn "Interrupted"
             end
 
             def help(subcommand = client)
+                puts
+                if safe?
+                    puts Roby.color("Currently in safe mode, use 'unsafe' to switch", :bold)
+                    puts "Job commands like drop_job, kill_job, ... are queued, only sent if on 'process'"
+                    puts "review           display the pending job commands"
+                    puts "process          apply the pending job commands"
+                    puts "cancel           clear the pending job commands"
+                else
+                    puts Roby.color("Currently in unsafe mode, use 'safe' to switch", :bold, :red)
+                    puts "Job commands like drop_job, kill_job, ... are sent directly"
+                end
+
                 puts
                 if subcommand.respond_to?(:description)
                     puts Roby.color(subcommand.description.join("\n"), :bold)
@@ -288,6 +392,7 @@ module Roby
             #   {#summarize_exception}
             def summarize_pending_messages(already_summarized = Set.new)
                 summarized = Set.new
+                messages = []
                 queues = {exception: client.exception_queue,
                           job_progress: client.job_progress_queue,
                           notification: client.notification_queue}
@@ -296,12 +401,12 @@ module Roby
                         summarized << id
                         if !already_summarized.include?(id)
                             msg, complete = send("summarize_#{type}", *args)
-                            yield "##{id} #{msg}"
+                            messages << "##{id} #{msg}"
                             complete
                         end
                     end
                 end
-                summarized
+                return summarized, messages
             end
 
             # Polls for messages from the remote interface and yields them. It
@@ -315,36 +420,48 @@ module Roby
                 already_summarized = Set.new
                 was_connected = nil
                 while true
-                    mutex.synchronize do
-                        has_valid_connection =
+                    has_valid_connection =
+                        begin
+                            client.poll
+                            true
+                        rescue Exception
                             begin
-                                client.poll
+                                connect(nil)
+                                client.io.reset_thread_guard
                                 true
                             rescue Exception
-                                begin
-                                    connect(nil)
-                                    true
-                                rescue Exception
-                                end
                             end
-
-                        already_summarized = 
-                            summarize_pending_messages(already_summarized) do |msg|
-                                yield msg
-                            end
-                        if has_valid_connection
-                            was_connected = true
                         end
 
-                        if has_valid_connection && !was_connected
-                            RbReadline.puts "reconnected"
-                        elsif !has_valid_connection && was_connected
-                            RbReadline.puts "lost connection, reconnecting ..."
-                        end
-                        was_connected = has_valid_connection
+                    already_summarized, messages =
+                        summarize_pending_messages(already_summarized)
+                    yield(has_valid_connection, messages)
+                    if has_valid_connection
+                        was_connected = true
                     end
+
+                    if has_valid_connection && !was_connected
+                        RbReadline.puts "reconnected"
+                    elsif !has_valid_connection && was_connected
+                        RbReadline.puts "lost connection, reconnecting ..."
+                    end
+                    was_connected = has_valid_connection
+
                     sleep period
                 end
+            end
+
+            # Whether the shell should stop displaying any notification
+            def silent(be_silent)
+                @silent = be_silent
+            end
+
+            # Make the remote app quit
+            #
+            # This is defined explicitely because otherwise IRB "hooks" on quit
+            # to terminate the shell instead
+            def quit
+                call(Hash.new, [], :quit)
             end
         end
     end

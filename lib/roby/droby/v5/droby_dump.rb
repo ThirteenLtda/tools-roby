@@ -1,7 +1,47 @@
 module Roby
     module DRoby
         module V5
+            module BidirectionalGraphDumper
+                class DRoby
+                    attr_reader :vertices
+                    attr_reader :edges
+
+                    def initialize(vertices, edges)
+                        @vertices = vertices
+                        @edges    = edges
+                    end
+
+                    def proxy(peer)
+                        graph = Relations::BidirectionalDirectedAdjacencyGraph.new
+                        peer.load_groups(vertices) do |vertices|
+                            vertices.each { |v| graph.add_vertex(v) }
+                            edges.each_slice(3) do |u, v, info|
+                                graph.add_edge(
+                                    peer.local_object(u),
+                                    peer.local_object(v),
+                                    peer.local_object(info))
+                            end
+                        end
+                        graph
+                    end
+                end
+
+                def droby_dump(peer)
+                    peer.dump_groups(self.vertices) do |vertices|
+                        edges = Array.new
+                        each_edge.each do |u, v, info|
+                            edges << peer.dump(u) << peer.dump(v) << peer.dump(info)
+                        end
+                        DRoby.new(vertices, edges)
+                    end
+                end
+            end
+
             module ModelDumper
+                def droby_marshallable?
+                    true
+                end
+
                 def droby_dump(peer)
                     DRobyModel.new(
                         name,
@@ -68,7 +108,7 @@ module Roby
                 # the +dest+ peer.
                 def droby_dump(peer)
                     formatted = Roby.format_exception(self)
-                    DRoby.new(peer.dump(self.class),
+                    DRoby.new(peer.dump_model(self.class),
                               peer.dump(failure_point),
                               fatal?,
                               message,
@@ -147,8 +187,7 @@ module Roby
                         trace     = peer.local_object(self.trace)
                         exception = peer.local_object(self.exception)
                         result = ExecutionException.new(exception)
-                        result.trace.clear
-                        result.trace.concat(trace)
+                        result.trace.replace(trace)
                         result.handled = self.handled
                         result
                     end
@@ -162,10 +201,18 @@ module Roby
                     include ModelDumper
 
                     def droby_dump(peer)
+                        arguments = __arguments.each_value.map do |arg|
+                            if arg.has_default?
+                                [arg.name, true, peer.dump(arg.default), arg.doc]
+                            else
+                                [arg.name, false, nil, arg.doc]
+                            end
+                        end
+
                         DRoby.new(
                             name,
                             peer.known_siblings_for(self),
-                            argument_set,
+                            arguments,
                             DRobyModel.dump_supermodel(peer, self),
                             DRobyModel.dump_provided_models_of(peer, self),
                             each_event.map { |_, ev| [ev.symbol, ev.controlable?, ev.terminal?] })
@@ -173,18 +220,35 @@ module Roby
 
                     class DRoby < DRobyModel
                         attr_reader :events
-                        attr_reader :argument_set
+                        attr_reader :arguments
 
-                        def initialize(name, remote_siblings, argument_set, supermodel, provided_models, events)
+                        def initialize(name, remote_siblings, arguments, supermodel, provided_models, events)
                             super(name, remote_siblings, supermodel, provided_models)
-                            @argument_set = argument_set
+                            @arguments = arguments
                             @events = events
                         end
 
+                        def unmarshal_dependent_models(peer)
+                            super
+
+                            @arguments.each do |name, has_default, default, doc|
+                                if has_default
+                                    peer.local_object(default)
+                                end
+                            end
+                        end
+
                         def update(peer, local_object, fresh_proxy: false)
-                            argument_set.each do |arg_name|
-                                if !local_object.has_argument?(arg_name)
-                                    local_object.argument arg_name
+                            if @argument_set # Backward compatibility
+                                arguments = @argument_set.map { |name| [name, false, nil, nil] }
+                            end
+
+                            @arguments.each do |name, has_default, default, doc|
+                                if !local_object.has_argument?(name)
+                                    if !has_default
+                                        default = Roby::Models::Task::NO_DEFAULT_ARGUMENT
+                                    end
+                                    local_object.argument name, default: peer.local_object(default), doc: doc
                                 end
                             end
                             events.each do |name, controlable, terminal|
@@ -217,9 +281,9 @@ module Roby
                     # Update an existing proxy, using the information stored in this DRoby
                     # object.
                     def update(peer, proxy, fresh_proxy: false)
-                        proxy.owners.clear
+                        proxy.clear_owners
                         owners.each do |m_owner|
-                            proxy.owners << peer.local_object(m_owner)
+                            proxy.add_owner(peer.local_object(m_owner))
                         end
                     end
                 end
@@ -239,6 +303,13 @@ module Roby
                     def initialize(remote_siblings, owners, model, plan_id)
                         super(remote_siblings, owners)
                         @model, @plan_id = model, plan_id
+                    end
+
+                    def local_plan(peer)
+                        if plan_id
+                            peer.local_plan(plan_id)
+                        else TemplatePlan.new
+                        end
                     end
                 end
             end
@@ -273,9 +344,9 @@ module Roby
                     # Create a new proxy which maps the object of +peer+ represented by
                     # this communication intermediate.
                     def proxy(peer)
-                        local_object = peer.local_object(model).new(plan: peer.local_plan(plan_id))
+                        local_object = peer.local_object(model).new(plan: local_plan(peer))
                         if controlable
-                            local_object.command = lambda { } 
+                            local_object.command = lambda { }
                         end
                         local_object
                     end
@@ -363,6 +434,22 @@ module Roby
                 end
             end
 
+            module DefaultArgumentDumper
+                def droby_dump(peer)
+                    DRoby.new(peer.dump(value))
+                end
+
+                class DRoby
+                    def initialize(value)
+                        @value = value
+                    end
+
+                    def proxy(peer)
+                        DefaultArgument.new(peer.local_object(@value))
+                    end
+                end
+            end
+
             module DelayedArgumentFromObjectDumper
                 def droby_dump(peer)
                     DRoby.new(
@@ -382,7 +469,7 @@ module Roby
                             delayed_arg.send(m)
                         end
                     end
-                end      
+                end
             end
 
             module TaskArgumentsDumper
@@ -415,12 +502,16 @@ module Roby
                         end
                     end
 
+                    d_model     = peer.dump_model(model)
+                    d_arguments = peer.dump(arguments)
+                    d_data      = peer.dump(data)
+
                     DRoby.new(peer.known_siblings_for(self),
                               peer.dump(owners),
-                              peer.dump(model),
-                              plan.droby_id, 
-                              peer.dump(arguments),
-                              peer.dump(data),
+                              d_model,
+                              plan.droby_id,
+                              d_arguments,
+                              d_data,
                               mission: mission?, started: started?,
                               finished: finished?, success: success?)
                 end
@@ -449,8 +540,9 @@ module Roby
                     # Create a new proxy which maps the object of +peer+ represented by
                     # this communication intermediate.
                     def proxy(peer)
+                        model     = peer.local_object(self.model)
                         arguments = peer.local_object(self.arguments)
-                        peer.local_object(model).new(arguments.merge(plan: peer.local_plan(plan_id)))
+                        model.new(plan: local_plan(peer), **arguments)
                     end
 
                     # Updates an already existing proxy using the information contained
@@ -486,11 +578,11 @@ module Roby
                         permanent_events = peer.dump(self.permanent_events)
                         task_relation_graphs = each_task_relation_graph.map do |g|
                             edges = peer.dump(g.each_edge.flat_map { |*args| args })
-                            [peer.dump(g.class), edges]
+                            [peer.dump_model(g.class), edges]
                         end
                         event_relation_graphs = each_event_relation_graph.map do |g|
                             edges = peer.dump(g.each_edge.flat_map { |*args| args })
-                            [peer.dump(g.class), edges]
+                            [peer.dump_model(g.class), edges]
                         end
 
                         DRoby.new(
@@ -597,11 +689,79 @@ module Roby
                         end
 
                         def droby_dump!(peer)
-                            @action_interface_model = peer.dump(action_interface_model)
-                            @returned_type = peer.dump(returned_type)
+                            @returned_type = peer.dump_model(returned_type)
                             @arguments = peer.dump(arguments)
-                            @coordination_model = nil
+                            # This is a cached value, invalidate it
                             @returned_task_type = nil
+                        end
+
+                        def proxy(peer)
+                            result = self.dup
+                            result.proxy!(peer)
+                            result
+                        end
+
+                        def proxy!(peer)
+                            @returned_type = peer.local_model(returned_type)
+                            @arguments = peer.local_object(arguments)
+                        end
+                    end
+
+                    module InterfaceActionDumper
+                        def droby_dump!(peer)
+                            super
+                            @action_interface_model = peer.dump(action_interface_model)
+                        end
+
+                        def proxy_from_existing(peer)
+                            interface_model = peer.local_object(@action_interface_model)
+                            if action = interface_model.find_action_by_name(name)
+                                # Load the return type and the default values, we must
+                                # make sure that any dumped droby-identifiable object
+                                # is loaded nonetheless
+                                peer.local_model(returned_type)
+                                arguments.each { |arg| peer.local_object(arg.default) }
+                            end
+                            return action, interface_model
+                        end
+                    end
+
+                    module MethodActionDumper
+                        include InterfaceActionDumper
+
+                        def proxy(peer, resolve_existing: true)
+                            if resolve_existing
+                                existing, _interface_model = proxy_from_existing(peer)
+                                if existing
+                                    return existing
+                                end
+                            end
+
+                            interface_model = peer.local_object(@action_interface_model)
+                            action = super(peer)
+                            action.action_interface_model = interface_model
+                            action
+                        end
+                    end
+
+                    module CoordinationActionDumper
+                        include InterfaceActionDumper
+
+                        def proxy(peer)
+                            existing, interface_model = proxy_from_existing(peer)
+                            if existing
+                                return existing
+                            else
+                                action = super(peer)
+                                action.coordination_model =
+                                    interface_model.create_coordination_model(action, Coordination::Actions) {}
+                                action
+                            end
+                        end
+
+                        def droby_dump!(peer)
+                            super
+                            @coordination_model = nil
                         end
                     end
 
@@ -644,7 +804,7 @@ module Roby
                             Roby::Queries::AndMatcher.new(*peer.local_object(ops))
                         end
                     end
-                    
+
                     # Returns an intermediate representation of +self+ suitable to be sent
                     # to the +dest+ peer.
                     def droby_dump(peer)
@@ -663,7 +823,7 @@ module Roby
                             Roby::Queries::NotMatcher.new(peer.local_object(@op))
                         end
                     end
-                    
+
                     # Returns an intermediate representation of +self+ suitable to be sent
                     # to the +dest+ peer.
                     def droby_dump(peer)
@@ -683,7 +843,7 @@ module Roby
                             Roby::Queries::OrMatcher.new(*peer.local_object(ops))
                         end
                     end
-                    
+
                     # Returns an intermediate representation of +self+ suitable to be sent
                     # to the +dest+ peer.
                     def droby_dump(dest)
@@ -709,7 +869,7 @@ module Roby
                             matcher
                         end
                     end
-                    
+
                     # Returns an intermediate representation of +self+ suitable to be sent
                     # to the +dest+ peer.
                     def droby_dump(peer)
@@ -730,17 +890,17 @@ module Roby
                         end
                         def proxy(peer)
                             matcher = Roby::Queries::LocalizedErrorMatcher.new
-                            matcher.with_model(peer.local_object(model))
+                            matcher.with_model(peer.local_model(model))
                             matcher.with_origin(peer.local_object(failure_point_matcher))
                             matcher
                         end
                     end
-                    
+
                     # Returns an intermediate representation of +self+ suitable to be sent
                     # to the +dest+ peer.
                     def droby_dump(peer)
                         DRoby.new(
-                            peer.dump(model),
+                            peer.dump_model(model),
                             peer.dump(failure_point_matcher))
                     end
                 end
@@ -772,14 +932,14 @@ module Roby
                         # argument set. This is to be used by DRoby-dumped versions of
                         # subclasses of TaskMatcher.
                         def proxy(peer, matcher: Roby::Queries::PlanObjectMatcher.new)
-                            model  = peer.local_object(self.model)
+                            model  = self.model.map { |m| peer.local_model(m) }
                             owners = peer.local_object(self.owners)
 
                             matcher.with_model(model)
-                            matcher.predicates.merge(predicates)
-                            matcher.neg_predicates.merge(neg_predicates)
-                            matcher.indexed_predicates.merge(indexed_predicates)
-                            matcher.indexed_neg_predicates.merge(indexed_neg_predicates)
+                            matcher.predicates.concat(predicates)
+                            matcher.neg_predicates.concat(neg_predicates)
+                            matcher.indexed_predicates.concat(indexed_predicates)
+                            matcher.indexed_neg_predicates.concat(indexed_neg_predicates)
                             matcher.parents.merge!(peer.local_object(parents))
                             matcher.children.merge!(peer.local_object(children))
                             matcher.owners.concat(owners)
@@ -792,7 +952,7 @@ module Roby
                     # representation. It is used for code reuse by subclasses of
                     # TaskMatcher.
                     def droby_dump(peer, droby: DRoby)
-                        droby.new(peer.dump(model),
+                        droby.new(model.map { |m| peer.dump_model(m) },
                                   predicates, neg_predicates, indexed_predicates, indexed_neg_predicates,
                                   peer.dump(owners),
                                   peer.dump(parents), peer.dump(children))
@@ -852,7 +1012,7 @@ module Roby
                             query
                         end
                     end
-                    
+
                     # Returns an intermediate representation of +self+ suitable to be sent
                     # to the +dest+ peer.
                     def droby_dump(peer)

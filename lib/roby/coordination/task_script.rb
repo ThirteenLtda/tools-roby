@@ -88,7 +88,7 @@ module Roby
                         raise ArgumentError, "#{model.root} has no event called #{symbol}"
                     end
                 end
-                script_task, model_task = resolve_task(event.task)
+                _, model_task = resolve_task(event.task)
                 model_event  = model_task.find_event(event.symbol)
                 script_event = instance_for(model_event)
                 return script_event, model_event
@@ -100,9 +100,9 @@ module Roby
             # @param [Task] task the task that should be started
             # @param [Hash] dependency_options options that should be passed to
             #   TaskStructure::Dependency::Extension#depends_on
-            def start(task, dependency_options = Hash.new)
+            def start(task, explicit_start: false, **dependency_options)
                 task, model_task = resolve_task(task)
-                model.start(model_task, dependency_options)
+                model.start(model_task, explicit_start: explicit_start, **dependency_options)
                 task
             end
 
@@ -155,7 +155,7 @@ module Roby
             # @param [Float] seconds the number of seconds to stop the script
             #   execution
             def sleep(seconds)
-                task = start(Tasks::Timeout.new(delay: seconds))
+                task = start(Tasks::Timeout.new(delay: seconds), explicit_start: true)
                 wait task.stop_event
             end
 
@@ -191,7 +191,7 @@ module Roby
             # emit an event (and quit the block)
             #
             # @param [Hash] options
-            # @option options [Event] :event (nil) if set, the given event will
+            # @option options [Event] :emit (nil) if set, the given event will
             #   be emitted when the timeout is reached. Otherwise, a
             #   Script::TimedOut exception is generated with the script's
             #   supporting task as origin
@@ -207,7 +207,7 @@ module Roby
             def timeout_start(seconds, options = Hash.new)
                 options, timeout_options  = Kernel.filter_options options, emit: nil
                 if event = options[:emit]
-                    script_event, model_event = resolve_event(event)
+                    _, model_event = resolve_event(event)
                 end
                 model.timeout_start(seconds, timeout_options.merge(emit: model_event))
             end
@@ -220,13 +220,22 @@ module Roby
             end
 
             # Used by Script
-            def start_task(task)
+            def start_task(task, explicit_start: false)
                 root_task.start_event.remove_causal_link(task.resolve.start_event)
+                if explicit_start
+                    task.resolve.start_event.call
+                end
+            end
+
+            def respond_to_missing?(m, include_private)
+                if m =~ /_(?:event|child)$/
+                    instance_for(model.root).respond_to?(m)
+                else super
+                end
             end
 
             def method_missing(m, *args, &block)
-                case m.to_s
-                when /(.*)_(event|child)$/
+                if m =~ /_(?:event|child)$/
                     instance_for(model.root).send(m, *args, &block)
                 else super
                 end
@@ -279,6 +288,3 @@ module Roby
         end
     end
 end
-
-
-

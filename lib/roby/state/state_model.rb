@@ -59,7 +59,7 @@ module Roby
         def resolve_data_sources(object, state)
             each_member do |name, field|
                 if field.respond_to?(:data_source)
-                    state.data_sources.__set(name, field.data_source.resolve(object))
+                    state.data_sources.set(name, field.data_source.resolve(object))
                 else
                     field.resolve_data_sources(object, state.__get(name, true))
                 end
@@ -69,7 +69,7 @@ module Roby
 
     # Representation of the last known state
     class StateLastValueField < OpenStruct
-        def method_missing(name, *args, &block)
+        def method_missing(name, *args)
             if name =~ /=$/
                 raise ArgumentError, "cannot write to a StateLastValueField object"
             end
@@ -180,7 +180,7 @@ module Roby
 
         # Reimplemented from OpenStruct
         def method_missing(name, *args)
-            if name.to_s =~ /(.*)=$/
+            if name =~ /(.*)=$/
                 if data_source = data_sources.get($1)
                     raise ArgumentError, "cannot explicitely set a field for which a data source exists"
                 end
@@ -206,9 +206,9 @@ module Roby
         def read
             data_sources.each_member do |field_name, field_source|
                 new_value = field_source.read
-                __set(field_name, new_value)
+                set(field_name, new_value)
                 if new_value
-                    last_known.__set(field_name, new_value)
+                    last_known.set(field_name, new_value)
                 end
             end
         end
@@ -227,10 +227,10 @@ module Roby
     #  * the current data source for a state variable is stored in
     #    data_sources.path.to.value
     class StateSpace < StateField
-	def initialize(model = nil)
+        def initialize(model = nil)
             @exported_fields = nil
-	    super(model)
-	end
+            super(model)
+        end
 
         # Declares that no state fields should be marshalled. The default is to
         # export everything
@@ -260,10 +260,10 @@ module Roby
         # If #export_all has been called, a call to #export cancels it.
         #
         # See also #export_none and #export_all
-	def export(*names)
+        def export(*names)
             @exported_fields ||= Set.new
-	    @exported_fields.merge names.map { |n| n.to_s }.to_set
-	end
+            @exported_fields.merge names.map { |n| n.to_s }.to_set
+        end
 
         def create_subfield(name)
             model = if self.model then self.model.get(name) end
@@ -277,7 +277,7 @@ module Roby
         #
         # Which fields get marshalled can be controlled with #export_all,
         # #export_none and #export. The default is to marshal all fields.
-	def _dump(lvl = -1)
+        def _dump(lvl = -1)
             if !@exported_fields
                 super
             else
@@ -288,16 +288,16 @@ module Roby
                 marshalled_members.compact!
                 Marshal.dump([marshalled_members, @aliases])
             end
-	end
+        end
 
-	def deep_copy
-	    exported_fields, @exported_fields = @exported_fields, Set.new
-	    Marshal.load(Marshal.dump(self))
-	ensure
-	    @exported_fields = exported_fields
-	end
+        def deep_copy
+            exported_fields, @exported_fields = @exported_fields, Set.new
+            Marshal.load(Marshal.dump(self))
+        ensure
+            @exported_fields = exported_fields
+        end
 
-	def testing?; Roby.app.testing? end
-	def simulation?; Roby.app.simulation? end
+        def testing?; Roby.app.testing? end
+        def simulation?; Roby.app.simulation? end
     end
 end

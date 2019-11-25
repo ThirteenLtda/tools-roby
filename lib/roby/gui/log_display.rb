@@ -140,6 +140,10 @@ module Roby
             end
 
             def connect_display(history_widget, view)
+                if history_widget.start_time && history_widget.current_time
+                    view.update_time_range(history_widget.start_time, history_widget.current_time)
+                    view.update_display_time(history_widget.display_time)
+                end
                 Qt::Object.connect(history_widget, SIGNAL('appliedSnapshot(QDateTime)'),
                                    view, SLOT('setDisplayTime(QDateTime)'))
                 Qt::Object.connect(history_widget, SIGNAL('liveUpdate(QDateTime)'),
@@ -168,8 +172,8 @@ module Roby
             slots 'warn(QString)'
 
             # Opens +filename+ and reads the data from there
-            def open(filename)
-                history_widget.open(filename)
+            def open(filename, index_path: nil)
+                history_widget.open(filename, index_path: index_path)
             end
 
             # Displays the data incoming from +client+

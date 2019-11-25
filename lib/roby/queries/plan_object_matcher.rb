@@ -4,10 +4,17 @@ module Roby
     class PlanObjectMatcher < MatcherBase
         # @api private
         #
+        # The actual instance that should match
+        #
+        # @return [nil,Object]
+        attr_reader :instance
+
+        # @api private
+        #
         # A set of models that should be provided by the object
         #
         # @return [Array<Class>]
-	attr_reader :model
+        attr_reader :model
         
         # @api private
         #
@@ -47,57 +54,67 @@ module Roby
         attr_reader :children
 
         # Initializes an empty TaskMatcher object
-	def initialize
+        def initialize(instance = nil)
+            @instance             = instance
+            @indexed_query        = !@instance
             @model                = Array.new
-	    @predicates           = Set.new
-	    @neg_predicates       = Set.new
-	    @indexed_predicates     = Set.new
-	    @indexed_neg_predicates = Set.new
-	    @owners               = Array.new
-            @parents              = Hash.new { |h, k| h[k] = Array.new }
-            @children             = Hash.new { |h, k| h[k] = Array.new }
-	end
+            @predicates           = Array.new
+            @neg_predicates       = Array.new
+            @indexed_predicates     = Array.new
+            @indexed_neg_predicates = Array.new
+            @owners               = Array.new
+            @parents              = Hash.new
+            @children             = Hash.new
+        end
+
+        # Match an instance explicitely
+        def with_instance(instance)
+            @instance = instance
+            @indexed_query = false
+            self
+        end
 
         # Filters on ownership
         #
         # Matches if the object is owned by the listed peers.
         #
         # Use #self_owned to match if it is owned by the local plan manager.
-	def owned_by(*ids)
-	    @owners |= ids
-	    self
-	end
+        def owned_by(*ids)
+            @owners |= ids
+            self
+        end
 
         # Filters locally-owned tasks
         #
         # Matches if the object is owned by the local plan manager.
-	def self_owned
+        def self_owned
             predicates << :self_owned?
-	    self
-	end
+            self
+        end
 
         # Filters out locally-owned tasks
         #
         # Matches if the object is owned by the local plan manager.
         def not_self_owned
             neg_predicates << :self_owned?
-	    self
+            self
         end
 
-	# Filters on the task model
+        # Filters on the task model
         #
         # Will match if the task is an instance of +model+ or one of its
         # subclasses.
-	def with_model(model)
-	    @model = Array(model)
-	    self
-	end
+        def with_model(model)
+            @model = Array(model)
+            self
+        end
 
-	class << self
+        class << self
             # @api private
             def match_predicate(name, positive_index = nil, negative_index = nil)
                 method_name = name.to_s.gsub(/\?$/, '')
                 if Index::PREDICATES.include?(name)
+                    indexed_predicate = true
                     positive_index ||= [["#{name}"], []]
                     negative_index ||= [[], ["#{name}"]]
                 end
@@ -108,6 +125,7 @@ module Roby
                     if neg_predicates.include?(:#{name})
                         raise ArgumentError, "trying to match (#{name} & !#{name})"
                     end
+                    #{"@indexed_query = false" if !indexed_predicate}
                     predicates << :#{name}
                     #{if !positive_index[0].empty? then ["indexed_predicates", *positive_index[0]].join(" << :") end}
                     #{if !positive_index[1].empty? then ["indexed_neg_predicates", *positive_index[1]].join(" << :") end}
@@ -117,6 +135,7 @@ module Roby
                     if predicates.include?(:#{name})
                         raise ArgumentError, "trying to match (#{name} & !#{name})"
                     end
+                    #{"@indexed_query = false" if !indexed_predicate}
                     neg_predicates << :#{name}
                     #{if !negative_index[0].empty? then ["indexed_predicates", *negative_index[0]].join(" << :") end}
                     #{if !negative_index[1].empty? then ["indexed_neg_predicates", *negative_index[1]].join(" << :") end}
@@ -125,7 +144,7 @@ module Roby
                 EOD
                 declare_class_methods(method_name, "not_#{method_name}")
             end
-	end
+        end
 
         ##
         # :method: executable
@@ -141,7 +160,7 @@ module Roby
         #
         # See also #executable, PlanObject#executable?
 
-	match_predicates :executable?
+        match_predicates :executable?
 
         declare_class_methods :with_model, :owned_by, :self_owned
 
@@ -180,7 +199,8 @@ module Roby
         #
         def with_child(other_query, relation = nil, relation_options = nil)
             relation, spec = handle_parent_child_arguments(other_query, relation, relation_options)
-            @children[relation] << spec
+            (@children[relation] ||= Array.new) << spec
+            @indexed_query = false
             self
         end
 
@@ -195,7 +215,8 @@ module Roby
         # See examples for #with_child
         def with_parent(other_query, relation = nil, relation_options = nil)
             relation, spec = handle_parent_child_arguments(other_query, relation, relation_options)
-            @parents[relation] << spec
+            (@parents[relation] ||= Array.new) << spec
+            @indexed_query = false
             self
         end
 
@@ -223,9 +244,19 @@ module Roby
         # equivalent to calling #filter() using a Index. This is used to
         # avoid an explicit O(N) filtering step after filter() has been called
         def indexed_query?
-            @children.empty? && @parents.empty? &&
-                Index::PREDICATES.superset?(predicates) &&
-                Index::PREDICATES.superset?(neg_predicates)
+            @indexed_query
+        end
+
+        def to_s
+            description = 
+                if instance
+                    instance.to_s
+                elsif model.size == 1
+                    model.first.to_s
+                else
+                    "(#{model.map(&:to_s).join(",")})"
+                end
+            ([description] + predicates.map(&:to_s) + neg_predicates.map { |p| "not_#{p}" }).join(".")
         end
 
 
@@ -234,9 +265,13 @@ module Roby
         # @param [PlanObject] object the object to match
         # @return [Boolean]
         def ===(object)
-	    if !model.empty?
-		return unless object.fullfills?(model)
-	    end
+            if instance
+                return false if object != instance
+            end
+
+            if !model.empty?
+                return unless object.fullfills?(model)
+            end
 
             for parent_spec in @parents
                 result = handle_parent_child_match(object, parent_spec) do |relation, m, relation_options|
@@ -254,15 +289,45 @@ module Roby
                 return false if !result
             end
 
-	    for pred in predicates
-		return false if !object.send(pred)
-	    end
-	    for pred in neg_predicates
-		return false if object.send(pred)
-	    end
+            for pred in predicates
+                return false if !object.send(pred)
+            end
+            for pred in neg_predicates
+                return false if object.send(pred)
+            end
 
-	    return false if !owners.empty? && !(object.owners - owners).empty?
+            return false if !owners.empty? && !(object.owners - owners).empty?
             true
+        end
+
+        # @api private
+        #
+        # Resolve the indexed sets needed to filter an initial set in {#filter}
+        #
+        # @return [(Set,Set)] the positive (intersection) and
+        #   negative (difference) sets
+        def indexed_sets(index)
+            positive_sets = []
+            for m in @model
+                positive_sets << index.by_model[m]
+            end
+
+            for o in @owners
+                if candidates = index.by_owner[o]
+                    positive_sets << candidates
+                else
+                    return [Set.new, Set.new]
+                end
+            end
+
+            for pred in @indexed_predicates
+                positive_sets << index.by_predicate[pred]
+            end
+
+            negative_sets = @indexed_neg_predicates.
+                map { |pred| index.by_predicate[pred] }
+
+            return positive_sets, negative_sets
         end
 
         # Filters the tasks in +initial_set+ by using the information in
@@ -273,29 +338,25 @@ module Roby
         # @param [Set] initial_set
         # @param [Index] index
         # @return [Set]
-	def filter(initial_set, index)
-            for m in model
-                initial_set = initial_set.intersection(index.by_model[m])
+        def filter(initial_set, index, initial_is_complete: false)
+            positive_sets, negative_sets = indexed_sets(index)
+            positive_sets << initial_set if !initial_is_complete || positive_sets.empty?
+
+            negative = negative_sets.shift || Set.new
+            if negative_sets.size > 1
+                negative = negative.dup
+                negative_sets.each { |set| negative.merge(set) }
             end
 
-            for o in owners
-                if candidates = index.by_owner[o]
-                    initial_set = initial_set.intersection(candidates)
-                else
-                    return Set.new
-                end
+            positive_sets = positive_sets.sort_by(&:size)
+
+            result = Set.new
+            result.compare_by_identity
+            positive_sets.shift.each do |obj|
+                result.add(obj) if !negative.include?(obj) && positive_sets.all? { |set| set.include?(obj) }
             end
-
-	    for pred in indexed_predicates
-		initial_set = initial_set.intersection(index.by_predicate[pred])
-	    end
-
-	    for pred in indexed_neg_predicates
-		initial_set = initial_set.difference(index.by_predicate[pred])
-	    end
-
-	    initial_set
-	end
+            return result
+        end
     end
     end
 end

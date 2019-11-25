@@ -1,4 +1,7 @@
 class Exception
+    # Create a {Queries::CodeErrorMatcher} object that matches this exception
+    #
+    # @return [Queries::CodeErrorMatcher]
     def self.match
         Roby::CodeError.match.with_ruby_exception(self)
     end
@@ -10,7 +13,7 @@ class Exception
     def pretty_print(pp)
         pp.text "#{message} (#{self.class.name})"
     end
-    
+
     # True if +obj+ is involved in this error
     def involved_plan_object?(obj)
         false
@@ -23,6 +26,11 @@ module Roby
     # Exception base used for all errors that show an inconsistency inside Roby
     # itself
     class InternalError < RuntimeError; end
+
+    # Exception raised if an object is not droby-marshallable in a place where
+    # one is required
+    class NotMarshallable < ArgumentError
+    end
 
     # Module used to tag exceptions that "wrap" an original error from the user
     # code
@@ -40,6 +48,10 @@ module Roby
 
         def initialize(exceptions = Array.new)
             @original_exceptions = exceptions
+        end
+
+        def each_original_exception(&block)
+            @original_exceptions.each(&block)
         end
 
         def report_exceptions_from(object)
@@ -66,45 +78,52 @@ module Roby
         # If true, such an exception causes the execution engine to stop tasks
         # in the hierarchy. Otherwise, it only causes notification(s).
         def fatal?; true end
+        # If true, such an exception will be propagated in the plan dependency
+        # structure. Otherwise, it's directly reported to the plan itself (which
+        # can choose to handle it).
+        #
+        # This is usually set to false for exceptions that report global
+        # information about the plan, such as e.g. MissionFailedError
+        def propagated?; true end
         # The object describing the point of failure
-	attr_reader :failure_point
-        
+        attr_reader :failure_point
+
         # The objects of the given categories which are related to #failure_point
         attr_reader :failed_event, :failed_generator, :failed_task
 
         # Create a LocalizedError object with the given failure point
         def initialize(failure_point)
             super()
-	    @failure_point = failure_point
+            @failure_point = failure_point
 
             @failed_task, @failed_event, @failed_generator = nil
-	    if failure_point.kind_of?(Event)
-		@failed_event = failure_point
-		@failed_generator = failure_point.generator
-	    elsif failure_point.kind_of?(EventGenerator)
-		@failed_generator = failure_point
-	    elsif failure_point.kind_of?(Task)
-		@failed_task = failure_point
-	    end
+            if failure_point.kind_of?(Event)
+                @failed_event = failure_point
+                @failed_generator = failure_point.generator
+            elsif failure_point.kind_of?(EventGenerator)
+                @failed_generator = failure_point
+            elsif failure_point.kind_of?(Task)
+                @failed_task = failure_point
+            end
 
-	    if !@failed_task && @failed_generator && @failed_generator.respond_to?(:task)
-		@failed_task = failed_generator.task
-	    end
-	    if !@failed_task && !@failed_generator
-		raise ArgumentError, "cannot deduce a task and/or a generator from #{failure_point}"
-	    end
+            if !@failed_task && @failed_generator && @failed_generator.respond_to?(:task)
+                @failed_task = failed_generator.task
+            end
+            if !@failed_task && !@failed_generator
+                raise ArgumentError, "cannot deduce a task and/or a generator from #{failure_point}"
+            end
 
             if failed_event
                 failed_event.protect_all_sources
             end
-	end
+        end
 
         def to_execution_exception
             ExecutionException.new(self)
         end
 
         def pretty_print(pp)
-	    pp.text "#{self.class.name}"
+            pp.text "#{self.class.name}"
             if !message.empty?
                 pp.text ": #{message}"
             end
@@ -114,7 +133,7 @@ module Roby
 
         # True if +obj+ is involved in this error
         def involved_plan_object?(obj)
-            obj.kind_of?(PlanObject) && 
+            obj.kind_of?(PlanObject) &&
                 (obj == failed_event ||
                  obj == failed_generator ||
                  obj == failed_task)
@@ -124,6 +143,9 @@ module Roby
         def self.to_execution_exception_matcher
             Roby::Queries::ExecutionExceptionMatcher.new.with_model(self)
         end
+
+        # Create a {Queries::LocalizedErrorMatcher} that matches this exception
+        #
         # @return [Queries::LocalizedErrorMatcher]
         def self.match
             Roby::Queries::LocalizedErrorMatcher.new.with_model(self)
@@ -136,6 +158,9 @@ module Roby
     end
 
 
+    # Exception raises when attempting to add relations to a
+    # garbaged-but-not-finalized task
+    class ReusingGarbage < RuntimeError; end
     # Exception class used when trying to perform an operation on a finalized
     # object and the operation requires a plan
     class FinalizedPlanObject < RuntimeError; end
@@ -178,9 +203,6 @@ module Roby
             end
         end
     end
-    # Raised during event propagation if an event is called, while this event
-    # is not controlable.
-    class EventNotControlable < LocalizedError; end
     # Raised when an error occurs on a task while we were terminating it
     class TaskEmergencyTermination < LocalizedError
         attr_reader :reason
@@ -246,31 +268,46 @@ module Roby
         def error; original_exception end
         # Create a CodeError object from the given original exception object, and
         # with the given failure point
-	def initialize(error, *args)
-	    if error && !error.kind_of?(Exception)
-		raise TypeError, "#{error} should be an exception"
-	    end
-	    super(*args)
+        def initialize(error, *args)
+            if error && !error.kind_of?(Exception)
+                raise TypeError, "#{error} should be an exception"
+            end
+            super(*args)
             report_exceptions_from(error)
-	end
+        end
 
         def pretty_print(pp)
             pp.text "#{self.class.name}: user code raised an exception "
             failure_point.pretty_print(pp)
         end
 
+        # Create a {Queries::CodeErrorMatcher} that matches this exception
+        #
+        # @return [Queries::CodeErrorMatcher]
         def self.match
             Roby::Queries::CodeErrorMatcher.new.with_model(self)
         end
     end
+
+    # Raised when a command is being processed, but it cannot be (e.g. because
+    # of task state)
+    class CommandRejected < LocalizedError; end
+
+    # Raised when an event's emission has being requested, but it cannot be
+    # (e.g. because of task state)
+    class EmissionRejected < LocalizedError; end
 
     # Raised if a command block has raised an exception
     class CommandFailed < CodeError
         def pretty_print(pp)
             pp.text "uncaught exception in the command of the "
             failed_generator.pretty_print(pp)
+            pp.text " (#{self.class})"
         end
     end
+    # Raised during event propagation if an event is called, while this event
+    # is not controlable.
+    class EventNotControlable < LocalizedError; end
     # Raised when the call of an event has been canceled.
     # See EventGenerator#cancel.
     class EventCanceled < LocalizedError; end
@@ -287,16 +324,18 @@ module Roby
             end
         end
 
-	def pretty_print(pp) # :nodoc:
+        def pretty_print(pp) # :nodoc:
             pp.text "failed emission of the "
             failed_generator.pretty_print(pp)
-	end
+            pp.text " (#{self.class})"
+        end
     end
     # Raised when an event handler has raised.
     class EventHandlerError < CodeError
         def pretty_print(pp)
             pp.text "uncaught exception in an event handler of the "
             failed_generator.pretty_print(pp)
+            pp.text " (#{self.class})"
             pp.breakable
             pp.text "called during the propagation of "
             failed_event.pretty_print(pp)
@@ -305,14 +344,14 @@ module Roby
 
     # Raised when an exception handler has raised.
     class FailedExceptionHandler < CodeError
-	attr_reader :handled_exception
+        attr_reader :handled_exception
         attr_reader :handler
 
-	def initialize(error, object, handled_exception, handler)
-	    super(error, object)
-	    @handled_exception = handled_exception
+        def initialize(error, object, handled_exception, handler)
+            super(error, object)
+            @handled_exception = handled_exception
             @handler = handler
-	end
+        end
 
         def pretty_print(pp)
             pp.text "exception handler #{handler} failed while processing"
@@ -330,46 +369,46 @@ module Roby
         # Create an UnreachableEvent error for the given +generator+. +reason+
         # is supposed to be either nil or a plan object which is the reason why
         # +generator+ has become unreachable.
-	def initialize(generator, reason)
-	    super(generator)
+        def initialize(generator, reason)
+            super(generator)
             @reason    = reason
             report_exceptions_from(reason)
-	end
+        end
 
-	def pretty_print(pp) # :nodoc:
+        def pretty_print(pp) # :nodoc:
             pp.text "#{failed_generator} has become unreachable"
-	    if reason
+            if reason
                 reason = [*reason]
                 reason.each do |e|
                     pp.breakable
                     e.pretty_print(pp)
                 end
             end
-	end
+        end
     end
-    
+
     # Exception raised when the event loop aborts because of an unhandled
     # exception
     class Aborting < ExceptionBase
         def pretty_print(pp) # :nodoc:
             pp.text "control loop aborting because of unhandled exceptions"
         end
-	def backtrace # :nodoc:
-            [] 
+        def backtrace # :nodoc:
+            []
         end
     end
 
     # Raised by Plan#replace when the new task cannot replace the older one.
     class InvalidReplace < RuntimeError
         # The task being replaced
-	attr_reader :from
+        attr_reader :from
         # The task which should have replaced #from
         attr_reader :to
 
         # Create a new InvalidReplace object
-	def initialize(from, to)
-	    @from, @to = from, to
-	end
+        def initialize(from, to)
+            @from, @to = from, to
+        end
         def pretty_print(pp) # :nodoc:
             pp.text "invalid replacement: #{message}"
             pp.breakable
@@ -380,19 +419,21 @@ module Roby
             to.pretty_print(pp)
         end
     end
-    
+
     # Exception raised when a mission has failed
     class ToplevelTaskError < LocalizedError
         include UserExceptionWrapper
 
         attr_reader :reason
 
+        def propagated?; false end
+
         # Create a new MissionFailedError for the given mission
         def initialize(task, reason = nil)
             super(task.failure_event || task)
             @reason = reason || task.failure_reason
             report_exceptions_from(@reason)
-	end
+        end
 
         def pretty_print(pp)
             if reason
@@ -411,6 +452,7 @@ module Roby
         def pretty_print(pp)
             pp.text "mission failed: "
             failed_task.pretty_print(pp)
+            pp.breakable
             super(pp)
         end
     end
@@ -421,6 +463,7 @@ module Roby
         def pretty_print(pp)
             pp.text "permanent task failed: "
             failed_task.pretty_print(pp)
+            pp.breakable
             super(pp)
         end
     end
@@ -459,5 +502,45 @@ module Roby
             end
         end
     end
-end
 
+    # Exception raised when a finished task has a promise attached, or when one
+    # attempts to create one on a finished task
+    class PromiseInFinishedTask < RuntimeError; end
+
+    # Exception used when a state transition fails within an action state
+    # machine
+    class ActionStateTransitionFailed < LocalizedError
+        # The state that we're transitioning out of
+        # @return [Coordination::Task]
+        attr_reader :from_state
+        # The event that caused the transition
+        # @return [Event]
+        attr_reader :event
+        # The state that we were transitioning into
+        # @return [Coordination::Task]
+        attr_reader :to_state
+
+        def initialize(root_task, from_state, event, to_state, original_exception)
+            super(root_task)
+            @from_state = from_state
+            @event    = event
+            @to_state = to_state
+            report_exceptions_from(original_exception)
+        end
+
+        def pretty_print(pp)
+            pp.text "#{failed_task} failed a state transition"
+            pp.nest(2) do
+                pp.breakable
+                pp.text "from state "
+                pp.nest(2) { from_state.pretty_print(pp) }
+                pp.breakable
+                pp.text "to state "
+                pp.nest(2) { to_state.pretty_print(pp) }
+                pp.breakable
+                pp.text "caused by event "
+                pp.nest(2) { event.pretty_print(pp) }
+            end
+        end
+    end
+end

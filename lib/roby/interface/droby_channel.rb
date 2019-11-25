@@ -10,18 +10,30 @@ module Roby
             # @return [DRoby::Marshal] an object used to marshal or unmarshal
             #   objects to/from the connection
             attr_reader :marshaller
+            # The maximum byte count that the channel can hold on the write side
+            # until it bails out
+            attr_reader :max_write_buffer_size
 
-            def initialize(io, client, marshaller: DRoby::Marshal.new(auto_create_plans: true))
+            def initialize(io, client, marshaller: DRoby::Marshal.new(auto_create_plans: true), max_write_buffer_size: 25*1024**2)
                 @io = io
+                @io.fcntl(Fcntl::F_SETFL, Fcntl::O_NONBLOCK)
                 @client = client
 
                 @incoming =
                     if client?
-                        WebSocket::Frame::Incoming::Client.new
+                        WebSocket::Frame::Incoming::Client.new(type: :binary)
                     else
-                        WebSocket::Frame::Incoming::Server.new
+                        WebSocket::Frame::Incoming::Server.new(type: :binary)
                     end
                 @marshaller = marshaller
+                @max_write_buffer_size = max_write_buffer_size
+                @read_buffer  = String.new
+                @write_buffer = String.new
+                @write_thread = nil
+            end
+
+            def write_buffer_size
+                @write_buffer.size
             end
 
             def to_io
@@ -44,46 +56,63 @@ module Roby
                 io.flush
             end
 
+            # Wait until there is something to read on the channel
+            #
+            # @param [Numeric,nil] timeout a timeout after which the method
+            #   will return. Use nil for no timeout
+            # @return [Boolean] falsy if the timeout was reached, true
+            #   otherwise
+            def read_wait(timeout: nil)
+                !!IO.select([io], [], [], timeout)
+            end
+
             # Read one packet from {#io} and unmarshal it
             #
             # @return [Object,nil] returns the unmarshalled object, or nil if no
             #   full object can be found in the data received so far
             def read_packet(timeout = 0)
-                start = Time.now
-
-                begin
-                    if data = io.read_nonblock(1024 ** 2)
-                        @incoming << data
-                    end
-                rescue IO::WaitReadable
+                @read_thread ||= Thread.current
+                if @read_thread != Thread.current
+                    raise InternalError, "cross-thread access to droby channel: from #{@read_thread} to #{Thread.current}"
                 end
 
-                while !(packet = @incoming.next)
-                    if timeout
-                        remaining_time = timeout - (Time.now - start)
-                        return if remaining_time < 0
-                    end
+                deadline       = Time.now + timeout if timeout
+                remaining_time = timeout
 
+                if packet = @incoming.next
+                    return unmarshal_packet(packet)
+                end
+
+                while true
                     if IO.select([io], [], [], remaining_time)
                         begin
-                           if data = io.read_nonblock(1024 ** 2)
-                               @incoming << data
-                           end
-                        rescue IO::WaitReadable
+                            if io.sysread(1024 ** 2, @read_buffer)
+                                @incoming << @read_buffer
+                            end
+                        rescue Errno::EWOULDBLOCK, Errno::EAGAIN
                         end
+                    end
+
+                    if packet = @incoming.next
+                        return unmarshal_packet(packet)
+                    end
+
+                    if deadline
+                        remaining_time = deadline - Time.now
+                        return if remaining_time < 0
                     end
                 end
 
+            rescue SystemCallError, EOFError, IOError
+                raise ComError, "closed communication"
+            end
+
+            def unmarshal_packet(packet)
                 unmarshalled = begin Marshal.load(packet.to_s)
                                rescue TypeError => e
                                    raise ProtocolError, "failed to unmarshal received packet: #{e.message}"
                                end
                 marshaller.local_object(unmarshalled)
-
-            rescue Errno::ECONNRESET, EOFError, IOError
-                raise ComError, "closed communication"
-            rescue Errno::EPIPE
-                raise ComError, "broken communication channel"
             end
 
             # Write one ruby object (usually an array) as a marshalled packet and
@@ -100,9 +129,37 @@ module Roby
                         WebSocket::Frame::Outgoing::Server.new(data: marshalled, type: :binary)
                     end
 
-                io.write(packet.to_s)
-                nil
-            rescue Errno::EPIPE, IOError, Errno::ECONNRESET
+                push_write_data(packet.to_s)
+            end
+
+            def reset_thread_guard(read_thread = nil, write_thread = nil)
+                @write_thread = read_thread
+                @read_thread = write_thread
+            end
+
+            # Push queued data
+            #
+            # The write I/O is buffered. This method pushes data stored within
+            # the internal buffer and/or appends new data to it.
+            #
+            # @return [Boolean] true if there is still data left in the buffe,
+            #   false otherwise
+            def push_write_data(new_bytes = nil)
+                @write_thread ||= Thread.current
+                if @write_thread != Thread.current
+                    raise InternalError, "cross-thread access to droby channel: from #{@write_thread} to #{Thread.current}"
+                end
+
+                @write_buffer.concat(new_bytes) if new_bytes
+                written_bytes = io.syswrite(@write_buffer)
+
+                @write_buffer = @write_buffer[written_bytes..-1]
+                !@write_buffer.empty?
+            rescue Errno::EWOULDBLOCK, Errno::EAGAIN
+                if @write_buffer.size > max_write_buffer_size
+                    raise ComError, "droby_channel reached an internal buffer size of #{@write_buffer.size}, which is bigger than the limit of #{max_write_buffer_size}, bailing out"
+                end
+            rescue SystemCallError, IOError, EOFError
                 raise ComError, "broken communication channel"
             rescue RuntimeError => e
                 # Workaround what seems to be a Ruby bug ...

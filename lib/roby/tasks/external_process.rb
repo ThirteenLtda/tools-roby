@@ -8,12 +8,18 @@ module Roby
         #
         # The events will act as follows:
         # * the start command starts the process per se. The event is emitted once
-        #   exec() has been called with success
-        # * the signaled event is emitted when the process dies because of a signal
+        #   the process has been spawned with success
+        # * the signaled event is emitted when the process dies because of a signal.
+        #   The event's context is the Process::Status object.
         # * the failed event is emitted whenever the process exits with a nonzero
-        #   status
+        #   status. The event's context is the Process::Status object.
         # * the success event is emitted when the process exits with a zero status
-        # * the stop event is emitted when the process exits
+        # * the stop event is emitted when the process exits, regardless of how
+        #
+        # The task by default is not interruptible, because there is no good
+        # common way to gracefully terminate an external program. To e.g. use
+        # signals, one would need to explicitely make the :stop command send a
+        # signal to {#pid} and let ExternalProcess' signal handling do the rest.
         class ExternalProcess < Roby::Task
             ##
             # :attr_reader:
@@ -27,31 +33,27 @@ module Roby
             ##
             # :attr_reader:
             # The working directory. If not set, the current directory is used.
-            argument :working_directory
+            argument :working_directory, default: nil
 
-            # Redirection specification. See #redirect_output
-            attr_reader :redirection
+            # Event emitted if the process died because of a signal
+            #
+            # @param [Process::Status] the process status
+            event :signaled
 
-            def initialize(arguments)
-                arguments[:working_directory] ||= nil
-                            arguments[:command_line] = [arguments[:command_line]] unless arguments[:command_line].kind_of?(Array)
-                super(arguments)
-            end
+            forward :signaled => :failed
 
-            class << self
-                # The set of running ExternalProcess instances. It is a mapping
-                # from the PID value to the instances.
-                attr_reader :processes
-            end
-            @processes = Hash.new
+            # The PID of the child process, or nil if the child process is not
+            # running
+            attr_reader :pid
 
-            # Called by the SIGCHLD handler to announce that a particular process
-            # has finished. It calls #dead!(result) in the context of the execution
-            # thread, on the corresponding task
-            def self.dead!(pid, result) # :nodoc:
-                if task = processes[pid]
-                    task.execution_engine.once { task.dead!(result) }
+            def initialize(arguments = Hash.new)
+                if arg = arguments[:command_line]
+                    arguments[:command_line] = [arg] if !arg.kind_of?(Array)
                 end
+                @pid = nil
+                @buffer = nil
+                @redirection = Hash.new
+                super(arguments)
             end
 
             # Called to announce that this task has been killed. +result+ is the
@@ -68,11 +70,6 @@ module Roby
                 end
             end
 
-            # This event gets emitted if the process died because of a signal
-            event :signaled
-
-            forward signaled: :failed
-
             ##
             # If set to a string, the process' standard output will be redirected to
             # the given file. The following replacement is done:
@@ -87,120 +84,77 @@ module Roby
             #   redirect_output stdout: "file-out", stderr: "another-file"
             #   redirect_output nil
             #
-            def redirect_output(args)
-                if !args
-                    @redirection = nil
-                elsif args.respond_to? :to_str
-                    @redirection = args.to_str
-                else
-                    args = validate_options args, stdout: nil, stderr: nil
-                    if args[:stdout] == args[:stderr]
-                        @redirection = args[:stdout].to_str
+            def redirect_output(common = nil, stdout: nil, stderr: nil)
+                if @pid
+                    raise RuntimeError, "cannot change redirection after task start"
+                elsif common
+                    stdout = stderr = common
+                end
+
+                @redirection = Hash.new
+                if stdout
+                    @redirection[:stdout] = 
+                        if [:pipe, :close].include?(stdout) then stdout
+                        else stdout.to_str
+                        end
+                end
+                if stderr
+                    @redirection[:stderr] = 
+                        if [:pipe, :close].include?(stderr) then stderr
+                        else stderr.to_str
+                        end
+                end
+            end
+
+            # @api privater
+            #
+            # Handle redirection for a single stream (out or err)
+            def create_redirection(redir_target)
+                if !redir_target
+                    return [], nil
+                elsif redir_target == :close
+                    return [], :close
+                elsif redir_target == :pipe
+                    pipe, io = IO.pipe
+                    return [[:close, io]], io, pipe, String.new
+                elsif redir_target !~ /%p/
+                    # Assume no replacement in redirection, just open the file
+                    if redir_target[0, 1] == '+'
+                        io = File.open(redir_target[1..-1], 'a')
                     else
-                        @redirection = Hash.new
-                        @redirection[:stdout] = args[:stdout].to_str if args[:stdout]
-                        @redirection[:stderr] = args[:stderr].to_str if args[:stderr]
+                        io = File.open(redir_target, 'w')
                     end
+                    return [[:close, io]], io
+                else
+                    io = open_redirection(working_directory) 
+                    return [[redir_target, io]], io
                 end
             end
 
-            # The PID of the child process, or nil if the child process is not
-            # running
-            attr_reader :pid
-
-            # Error codes between the child and the parent. Note that the error
-            # codes must not be greater than 9
-            # :stopdoc:
-            KO_REDIRECTION  = 1
-            KO_NO_SUCH_FILE = 2
-            KO_EXEC         = 3
-            # :startdoc:
-
-            # Returns the file name based on the redirection pattern and the current
-            # PID values. This is called in the child process before exec().
-            def redirection_path(pattern) # :nodoc:
-                pattern.gsub '%p', Process.pid.to_s
-            end
-
-            # Starts the child process
-            def start_process # :nodoc:
-                # Open a pipe to monitor the child startup
-                r, w = IO.pipe
-
-                @pid = fork do
-                    # Open the redirection outputs
-                    stdout, stderr = nil
-                    begin
-                        if redirection.respond_to?(:to_str)
-                            stdout = stderr = File.open(redirection_path(redirection), "w")
-                        elsif redirection
-                            if stdout_file = redirection[:stdout]
-                                stdout = File.open(redirection_path(stdout_file), "w")
-                            end
-                            if stderr_file = redirection[:stderr]
-                                stderr = File.open(redirection_path(stderr_file), "w")
-                            end
-                        end
-                    rescue Exception => e
-                        Roby.log_exception_with_backtrace(e, Roby, :error)
-                        w.write("#{KO_REDIRECTION}")
-                        return
-                    end
-
-                    STDOUT.reopen(stdout) if stdout
-                    STDERR.reopen(stderr) if stderr
-
-                    r.close
-                    w.fcntl(Fcntl::F_SETFD, 1) # set close on exit
-                    ::Process.setpgrp
-                    begin
-                        exec(*command_line)
-                    rescue Errno::ENOENT
-                        w.write("#{KO_NO_SUCH_FILE}")
-                    rescue Exception => e
-                        Roby.log_exception_with_backtrace(e, Roby, :error)
-                        w.write("#{KO_EXEC}")
-                    end
+            # @api private
+            #
+            # Setup redirections pre-spawn
+            def handle_redirection
+                if !@redirection[:stdout] && !@redirection[:stderr]
+                    return [], Hash.new
+                elsif (@redirection[:stdout] == @redirection[:stderr]) && ![:pipe, :close].include?(@redirection[:stdout])
+                    io = open_redirection(working_directory) 
+                    return [[@redirection[:stdout], io]], Hash[out: io, err: io]
                 end
 
-                ExternalProcess.processes[pid] = self
+                out_open, out_io, @out_pipe, @out_buffer =
+                    create_redirection(@redirection[:stdout])
+                err_open, err_io, @err_pipe, @err_buffer =
+                    create_redirection(@redirection[:stderr])
 
-                w.close
-                begin
-                    read, _ = select([r], nil, nil, 5)
-                rescue IOError
-                    Process.kill("SIGKILL", pid)
-                    retry
+                if @out_buffer || @err_buffer
+                    @read_buffer = String.new
                 end
 
-                if read && (control = r.read(1))
-                    case Integer(control)
-                    when KO_REDIRECTION
-                        raise "could not start #{command_line.first}: cannot establish output redirections"
-                    when KO_NO_SUCH_FILE
-                        raise "could not start #{command_line.first}: provided command does not exist"
-                    when KO_EXEC
-                        raise "could not start #{command_line.first}: exec() call failed"
-                    end
-                end
-
-                # This block is needed as there is a race condition between the fork
-                # and the assignation to ExternalProcess.processes (which is
-                # required for the SIGCHLD handler to work).
-                begin
-                    if Process.waitpid(pid, ::Process::WNOHANG)
-                        if exit_status = $?
-                            exit_status = exit_status.dup
-                        end
-                        engine.once { dead!(pid, exit_status) }
-                        return
-                    end
-                rescue Errno::ECHILD
-                end
-
-            rescue Exception => e
-                ExternalProcess.processes.delete(pid)
-                raise e
+                spawn_options = Hash.new
+                spawn_options[:out] = out_io if out_io
+                spawn_options[:err] = err_io if err_io
+                return (out_open + err_open), spawn_options
             end
 
             ##
@@ -209,42 +163,113 @@ module Roby
             # Starts the child process. Emits +start+ when the process is actually
             # started.
             event :start do |context|
-                if working_directory
-                    Dir.chdir(working_directory) do
-                        start_process
+                working_directory = (self.working_directory || Dir.pwd)
+                options = Hash[pgroup: 0, chdir: working_directory]
+
+                opened_ios, spawn_options = handle_redirection
+
+                @pid = Process.spawn *command_line, **spawn_options
+                opened_ios.each do |pattern, io|
+                    if pattern == :close
+                        io.close
+                    else
+                        FileUtils.mv io.path, File.join(working_directory, redirection_path(pattern, @pid))
                     end
-                else
-                    start_process
                 end
+
                 start_event.emit
             end
 
+            # @api private
+            #
+            # Returns the file name based on the redirection pattern and the current
+            # PID value.
+            def redirection_path(pattern, pid) # :nodoc:
+                pattern.gsub '%p', pid.to_s
+            end
+
+            # @api private
+            #
+            # Open the output file for redirection, before spawning
+            def open_redirection(dir)
+                Dir::Tmpname.create 'roby-external-process', dir do |path, _|
+                    return File.open(path, 'w+')
+                end
+            end
+
             # Kills the child process
+            #
+            # @param [String,Integer] signo the signal name or number, as
+            #   accepted by Process#kill
             def kill(signo)
                 Process.kill(signo, pid)
             end
 
-            on :stop do |event|
-                ExternalProcess.processes.delete(pid)
-            end
-
-            def self.handle_terminated_children(plan)
-                begin
-                    while pid = ::Process.wait(-1, ::Process::WNOHANG)
-                        if exit_status = $?
-                            exit_status = exit_status.dup
-                        end
-                        Roby.debug { "external process #{pid} terminated" }
-                        Tasks::ExternalProcess.dead! pid, exit_status
-                    end
-                rescue Errno::ECHILD
+            # @api private
+            #
+            # Read a given pipe, when an output is redirected to pipe
+            def read_pipe(pipe, buffer)
+                received = false
+                while true
+                    pipe.read_nonblock 1024, @read_buffer
+                    received = true
+                    buffer.concat(@read_buffer)
+                end
+            rescue EOFError
+                if received
+                    return true, buffer.dup
+                end
+            rescue IO::WaitReadable
+                if received
+                    return false, buffer.dup
                 end
             end
-        end
 
-        Roby::ExecutionEngine.add_propagation_handler(
-            description: 'ExternalProcess.handle_terminated_children',
-            &ExternalProcess.method(:handle_terminated_children))
+            # Method called when data is received on an intercepted stdout
+            #
+            # Intercept stdout by calling redirect_output(stdout: :pipe)
+            def stdout_received(data)
+            end
+
+            # Method called when data is received on an intercepted stderr
+            #
+            # Intercept stdout by calling redirect_output(stderr: :pipe)
+            def stderr_received(data)
+            end
+
+            def read_pipes
+                if @out_pipe
+                    eos, data = read_pipe(@out_pipe, @out_buffer)
+                    if eos
+                        @out_pipe = nil
+                    end
+                    if data
+                        stdout_received(data)
+                    end
+                end
+                if @err_pipe
+                    eos, data = read_pipe(@err_pipe, @err_buffer)
+                    if eos
+                        @err_pipe = nil
+                    end
+                    if data
+                        stderr_received(data)
+                    end
+                end
+            end
+
+            poll do
+                read_pipes
+                pid, exit_status = ::Process.waitpid2(self.pid, ::Process::WNOHANG)
+                if pid
+                    dead!(exit_status)
+                end
+            end
+
+            on :stop do |event|
+                read_pipes
+            end
+        end
     end
 end
 

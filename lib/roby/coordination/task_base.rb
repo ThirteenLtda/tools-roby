@@ -15,6 +15,12 @@ module Roby
                     @model = model
                 end
 
+                # Method that must be reimplemented in the task objects actually
+                # used in the coordination primitives
+                def resolve
+                    raise NotImplementedError, "#resolve must be reimplemented in objects meant to be used in the coordination primitives"
+                end
+
                 def find_child(role, child_model = nil)
                     child_model ||= model.find_child_model(role)
                     if !child_model
@@ -38,25 +44,22 @@ module Roby
                     end
                 end
 
-                def method_missing(m, *args, &block)
-                    case m.to_s
-                    when /(.*)_child$/
-                        if !args.empty?
-                            raise ArgumentError, "expected zero arguments, got #{args.size}"
-                        elsif child = find_child($1)
-                            child
-                        else raise NoMethodError.new("#{self} has no child named #{$1}", m)
-                        end
-                    when /(.*)_event$/
-                        if !args.empty?
-                            raise ArgumentError, "expected zero arguments, got #{args.size}"
-                        elsif event = find_event($1)
-                            event
-                        else raise NoMethodError.new("#{self} has no event named #{$1}", m)
-                        end
-                    else super
-                    end
+                def find_through_method_missing(m, args)
+                    MetaRuby::DSLs.find_through_method_missing(
+                        self, m, args,
+                        '_child' => :find_child,
+                        '_port'  => :find_port,
+                        '_event' => :find_event) || super
                 end
+                def has_through_method_missing?(m)
+                    MetaRuby::DSLs.has_through_method_missing?(
+                        self, m,
+                        '_child' => :has_child?,
+                        '_port'  => :has_port?,
+                        '_event' => :has_event?) || super
+                end
+
+                include MetaRuby::DSLs::FindThroughMethodMissing
 
                 def to_coordination_task(task_model); model.to_coordination_task(task_model) end
             end

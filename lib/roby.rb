@@ -22,6 +22,8 @@ module Roby
 end
 
 require 'concurrent'
+require 'backports/2.4.0/regexp/match'
+require 'roby/backports'
 
 require 'pp'
 require 'thread'
@@ -29,6 +31,7 @@ require 'set'
 require 'yaml'
 require 'pastel'
 require 'hooks'
+require 'fcntl'
 require 'metaruby/dsls'
 require 'utilrb/object/attribute'
 require 'utilrb/object/address'
@@ -43,9 +46,12 @@ require 'utilrb/unbound_method/call'
 require 'metaruby'
 
 require 'roby/version'
+require 'roby/droby/marshallable'
 require 'roby/droby/event_logging'
 
 require 'roby/support'
+require 'roby/disposable'
+require 'roby/promise'
 require 'roby/hooks'
 require 'roby/distributed_object'
 require 'roby/standard_errors'
@@ -55,6 +61,9 @@ require 'roby/relations'
 require 'roby/plan'
 require 'roby/executable_plan'
 require 'roby/template_plan'
+
+require 'roby/transaction'
+require 'roby/transaction/proxying'
 
 require 'roby/models/plan_object'
 require 'roby/plan_object'
@@ -85,18 +94,28 @@ require "roby/task_structure/dependency"
 require "roby/task_structure/error_handling"
 require "roby/task_structure/executed_by"
 require "roby/task_structure/planned_by"
-require 'roby/plan_service'
+
 require 'roby/tasks/aggregator'
 require 'roby/tasks/parallel'
 require 'roby/tasks/sequence'
 require 'roby/event_constraints'
 
-require 'roby/transactions/proxy'
-require 'roby/transactions'
+require 'roby/transaction/plan_object_proxy'
+require 'roby/transaction/event_generator_proxy'
+require 'roby/transaction/task_event_generator_proxy'
+require 'roby/transaction/task_proxy'
+
+require 'roby/plan_service'
+require 'roby/transaction/plan_service_proxy'
 
 require 'roby/decision_control'
 require 'roby/schedulers/null'
 require 'roby/execution_engine'
+begin
+    require 'gctools/oobgc'
+    Roby::ExecutionEngine.use_oob_gc = true
+rescue LoadError
+end
 require 'roby/app'
 require 'roby/state'
 require 'roby/singletons'
@@ -107,4 +126,8 @@ require 'roby/actions'
 require 'roby/coordination'
 
 require 'roby/droby/enable'
+require 'roby/custom_require'
 
+module Roby
+    BIN_DIR = File.expand_path(File.join("..", "bin"), __dir__)
+end

@@ -13,6 +13,8 @@ module Roby
                 include Roby::Hooks
                 include Roby::Hooks::InstanceHooks
 
+                JOB_REACHABLE = :reachable
+
                 # @!group Hooks
 
                 # @!method on_progress
@@ -56,10 +58,14 @@ module Roby
                 # @return [Symbol] the job's current state
                 attr_reader :state
 
-                def initialize(interface, job_id, state: nil, task: nil, placeholder_task: task)
+                def initialize(interface, job_id, state: JOB_REACHABLE, task: nil, placeholder_task: task)
                     @interface = interface
                     @job_id = job_id
-                    @state = state || :reachable
+                    @success = false
+                    @failed = false
+                    @has_ran = false
+                    @planning_finished = false
+                    update_state(state)
                     @task = task
                     @placeholder_task = placeholder_task
                 end
@@ -74,7 +80,7 @@ module Roby
                         batch.kill_job(job_id)
                     end
                     batch.start_job(action_name, action_arguments)
-                    job_id = batch.__process.last
+                    job_id = batch.__process.started_jobs_id.first
                     interface.monitor_job(job_id)
                 end
 
@@ -130,7 +136,39 @@ module Roby
                 # Called by {Interface} to update the job's state
                 def update_state(state)
                     @state = state
+                    if state != JOB_REACHABLE
+                        @planning_finished ||= Roby::Interface.planning_finished_state?(state)
+                        @success ||= Roby::Interface.success_state?(state)
+                        @failed  ||= Roby::Interface.error_state?(state)
+                        @has_ran ||= (Roby::Interface.planning_finished_state?(state) &&
+                                      state != JOB_READY && state != JOB_PLANNING_FAILED)
+                    end
                     run_hook :on_progress, state
+                end
+
+                # Tests whether planning finished
+                def planning_finished?
+                    @planning_finished
+                end
+
+                # Tests whether this job is running
+                def running?
+                    Roby::Interface.running_state?(state)
+                end
+
+                # Tests whether this job ran successfully
+                def success?
+                    @success
+                end
+
+                # Tests whether this job ran and failed
+                def failed?
+                    @failed
+                end
+
+                # Tests whether this job ran and finished
+                def finished?
+                    @has_ran && terminated?
                 end
 
                 # Tests whether this job is terminated
@@ -138,22 +176,19 @@ module Roby
                     Roby::Interface.terminal_state?(state)
                 end
 
-                # Tests whether this job is running
-                def running?
-                    Roby::Interface.running_state?(state)
-                end
-                
                 # Tests whether this job has been finalized
                 def finalized?
                     Roby::Interface.finalized_state?(state)
                 end
 
+                # Whether this job monitor is still active
+                def active?
+                    interface.active_job_monitor?(self)
+                end
+
                 # Start monitoring this job's state
                 def start
                     update_state(state)
-                    interface.on_unreachable do
-                        update_state(:unreachable)
-                    end
                     interface.add_job_monitor(self)
                 end
 
@@ -171,8 +206,23 @@ module Roby
                 def kill
                     interface.client.kill_job(job_id)
                 end
+
+                def pretty_print(pp)
+                    pp.text "##{job_id} #{action_name}"
+                    unless action_arguments.empty?
+                        pp.nest(2) do
+                            action_arguments.each do |k, v|
+                                pp.breakable
+                                pp.text "#{k}: "
+                                pp.nest(2) { v.pretty_print(pp) }
+                            end
+                        end
+                    end
+                    pp.breakable
+                    pp.breakable
+                    placeholder_task.pretty_print(pp)
+                end
             end
         end
     end
 end
-

@@ -69,7 +69,7 @@ module Roby
                     end
                 end
 
-                arguments = arguments.merge(required_arguments) do |name, old, new| 
+                arguments = arguments.merge(required_arguments) do |name, old, new|
                     if old != new
                         raise Roby::ModelViolation, "inconsistency in fullfilled models: #{old} and #{new}"
                     end
@@ -192,6 +192,7 @@ module Roby
                     if ev.plan == plan
                         events << ev
                         true
+                    else !ev.plan
                     end
                 end
                 tasks = Set.new
@@ -199,6 +200,7 @@ module Roby
                     if task.plan == plan
                         tasks << task
                         true
+                    else !task.plan
                     end
                 end
                 return Array.new if events.empty? && tasks.empty?
@@ -207,8 +209,7 @@ module Roby
 
                 # Get the set of tasks for which a possible failure has been
                 # registered The tasks that are failing the hierarchy requirements
-                # are registered in Hierarchy.failing_tasks. The interesting_events
-                # set is cleared when the events are finalized
+                # are registered in Hierarchy.failing_tasks.
                 events.each do |event|
                     task = event.task
                     tasks << task
@@ -274,7 +275,7 @@ module Roby
             module Extension
                 # True if +obj+ is a parent of this object in the hierarchy relation
                 # (+obj+ is realized by +self+)
-                def depended_upon_by?(obj);	parent_object?(obj, Dependency) end
+                def depended_upon_by?(obj);     parent_object?(obj, Dependency) end
 
                 # True if +obj+ is a child of this object in the hierarchy relation.
                 # If +recursive+ is true, take into account the whole subgraph.
@@ -433,7 +434,7 @@ module Roby
                 # +self+.
                 #
                 # I.e. if ['role1', 'role2', 'role3'] is a role path from +self+ to
-                # +task, it means that 
+                # +task, it means that
                 #
                 #    task1 = self.child_from_role('role1')
                 #    task2 = task1.child_from_role('role2')
@@ -478,7 +479,7 @@ module Roby
                 #
                 # success:: the list of success events. The default is [:success]
                 # failure:: the list of failing events. The default is [:failed]
-                # model:: 
+                # model::
                 #   a <tt>[task_model, arguments]</tt> pair which defines the task
                 #   model the parent is expecting.  The default value is to get these
                 #   parameters from +task+
@@ -503,9 +504,9 @@ module Roby
                         raise ArgumentError, "cannot add a dependency of a task to itself"
                     end
 
-                    options = Dependency.validate_options options, 
-                        model: [task.provided_models, task.meaningful_arguments], 
-                        success: :success.to_unbound_task_predicate, 
+                    options = Dependency.validate_options options,
+                        model: [task.provided_models, task.meaningful_arguments],
+                        success: :success.to_unbound_task_predicate,
                         failure: false.to_unbound_task_predicate,
                         remove_when_done: true,
                         consider_in_pending: true,
@@ -638,7 +639,7 @@ module Roby
                 # However, this fails in case +self+ is a root task in the dependency
                 # relation. Moreover, it might be handy to over-constrain the model
                 # computed through the dependency relation.
-                # 
+                #
                 # In both cases, a model can be specified explicitely by setting the
                 # fullfilled_model attribute. The value has to be
                 #
@@ -734,8 +735,11 @@ module Roby
                         [model[0]] + model[1]
                     else
                         models = self.model.fullfilled_model
-                        task_class = models.find { |m| m.kind_of?(Class) }
-                        [task_class] + models.find_all { |m| !task_class.has_ancestor?(m) }
+                        if (task_class = models.find { |m| m.kind_of?(Class) })
+                            [task_class] + models.find_all { |m| !task_class.has_ancestor?(m) }
+                        else
+                            models
+                        end
                     end
                 end
 
@@ -762,18 +766,13 @@ module Roby
                     end
                 end
 
-                def method_missing(m, *args, &block)
-                    if args.empty? && !block
-                        if m.to_s =~ /^(\w+)_child$/
-                            return child_from_role($1)
-                        end
-                    end
-                    super
+                def has_through_method_missing?(m)
+                    MetaRuby::DSLs.has_through_method_missing?(
+                        self, m, '_child' => :has_role?)
                 end
-
-                def finalized!(timestamp = nil)
-                    relation_graphs[Dependency].failing_tasks.delete(self)
-                    super
+                def find_through_method_missing(m, args)
+                    MetaRuby::DSLs.find_through_method_missing(
+                        self, m, args, '_child' => :find_child_from_role)
                 end
             end
 
@@ -830,7 +829,7 @@ module Roby
                 def fullfilled_model
                     explicit_fullfilled_model || implicit_fullfilled_model
                 end
-                
+
                 # Enumerates the models that all instances of this task model fullfill
                 #
                 # @yieldparam [Model<Task>,Model<TaskService>] model
@@ -902,28 +901,18 @@ module Roby
         end
 
         def pretty_print(pp) # :nodoc:
-            pp.text "#{child} failed"
+            child.pretty_print(pp)
             pp.breakable
-            pp.text "child #{relation[:roles].to_a.join(", ")} of #{parent}"
+            pp.text "child '#{relation[:roles].to_a.join(", ")}' of "
+            parent.pretty_print(pp)
+            pp.breakable
             pp.breakable
             if mode == :failed_event
-                pp.text "triggered the failure predicate '#{relation[:failure]}': "
+                pp.text "Child triggered the failure predicate '#{relation[:failure]}': "
             elsif mode == :unreachable_success
-                pp.text "cannot reach the success condition '#{relation[:success]}': "
+                pp.text "success condition can no longer be reached '#{relation[:success]}': "
             end
-            explanation.pretty_print(pp)
-
-            pp.breakable
-            pp.text "The failed relation is"
-            pp.breakable
-            pp.nest(2) do
-                pp.text "  "
-                parent.pretty_print pp
-                pp.breakable
-                pp.text "depends_on "
-                child.pretty_print pp
-            end
-            pp.breakable
+            explanation.pretty_print(pp, context_task: child)
         end
         def backtrace; [] end
 
@@ -933,4 +922,3 @@ module Roby
         end
     end
 end
-

@@ -18,21 +18,29 @@
   <depend package="binding_of_caller" />
   <depend package="rb-readline" />
   <depend package="concurrent-ruby" />
+  <depend package="ruby-backports" />
   <depend package="pastel" />
   <depend package="hooks" />
-  <depend package="rake-compiler" />
   <depend package="rgl" />
   <depend package="thor" />
   <depend package="autorespawn" optional="1" />
 
   <depend package="qtruby" optional='1' />
   <depend package="graphviz" optional='1' />
-  <depend package="tools/rubigen" optional="1" />
+
+  <depend_optional package="rest-client" />
+  <depend_optional package="grape" />
+  <depend_optional package="thin" />
 
   <depend_optional package="autorespawn" />
 
-  <test_depend package="minitest" />
-  <test_depend package="flexmock" />
-  <test_depend package="fakefs" />
+  <depend_optional package="minitest" />
+  <depend_optional package="flexmock" />
+  <depend_optional package="fakefs" />
+  <depend_optional package="timecop" />
+  <depend_optional package="stackprof" />
+  <depend_optional package="rbtrace" />
+
+  <test_depend package="aruba" />
 </package>
 

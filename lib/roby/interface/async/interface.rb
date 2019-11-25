@@ -31,6 +31,12 @@ module Roby
                 # The future used to connect to the remote process without blocking
                 # the main event loop
                 attr_reader :connection_future
+                # The port to the log server
+                #
+                # This can be used to create a plan rebuilder on this interface's
+                # underlying remote plan. It is queried at connection time, so
+                # it can be used locally without requiring to query the remote.
+                attr_reader :log_server_port
 
                 # @!group Hooks
 
@@ -58,6 +64,17 @@ module Roby
                 #     notification
                 #   @return [void]
                 define_hooks :on_notification
+                # @!method on_ui_event
+                #   Hooks called for UI events, that is notifications that are
+                #   meant for user interaction (but are mostly meaningless to
+                #   the user). These are arbitrary, and defined by Roby or
+                #   its plugins.
+                #
+                #   @yieldparam [String] event_name the event name
+                #   @yieldparam args the event arguments, which are
+                #     event-specific
+                #   @return [void]
+                define_hooks :on_ui_event
                 # @!method on_job_progress
                 #
                 #   Hooks called for job progress notifications
@@ -114,10 +131,14 @@ module Roby
 
                 DEFAULT_REMOTE_NAME = "localhost"
 
-                def initialize(remote_name = DEFAULT_REMOTE_NAME, port: Roby::Interface::DEFAULT_PORT, connect: true, &connection_method)
+                def initialize(remote_name = DEFAULT_REMOTE_NAME,
+                    port: Roby::Interface::DEFAULT_PORT, connect: true, &connection_method)
+
                     @connection_method = connection_method || lambda {
-                        Roby::Interface.connect_with_tcp_to(remote_name, port)
+                        Roby::Interface.connect_with_tcp_to(remote_name, port,
+                            handshake: [:actions, :commands, :jobs, :log_server_port])
                     }
+                    @log_server_port = nil
 
                     @remote_name = remote_name
                     @first_connection_attempt = true
@@ -129,11 +150,25 @@ module Roby
                     @new_job_listeners = Array.new
                 end
 
+                # Schedules an async call on the client
+                #
+                # @see Client#async_call
+                def async_call(path, m, *args, &block)
+                    raise 'client not connected' unless connected?
+                    client.async_call(path, m, *args, &block)
+                end
+
+                # Checks whether an async call is still pending
+                #
+                # @see Client#async_call_pending?
+                def async_call_pending?(call)
+                    connected? && client.async_call_pending?(call)
+                end
+
                 # Start a connection attempt
                 def attempt_connection
                     @connection_future = Concurrent::Future.new do
-                        client = connection_method.call
-                        [client, client.jobs]
+                        connection_method.call
                     end
                     connection_future.execute
                 end
@@ -153,31 +188,36 @@ module Roby
                 # with {#on_reachable}
                 def poll_connection_attempt
                     return if client
+                    return if !connection_future.complete?
 
-                    if connection_future.complete?
-                        case e = connection_future.reason
-                        when ConnectionError, ComError, ProtocolError
-                            Interface.info "failed connection attempt: #{e}"
-                            attempt_connection
-                            if @first_connection_attempt
-                                @first_connection_attempt = false
-                                run_hook :on_unreachable
-                            end
-                            nil
-                        when NilClass
-                            Interface.info "successfully connected"
-                            @client, jobs = connection_future.value
-                            jobs = jobs.map do |job_id, (job_state, placeholder_task, job_task)|
-                                JobMonitor.new(self, job_id, state: job_state, placeholder_task: placeholder_task, task: job_task)
-                            end
-                            run_hook :on_reachable, jobs
-                            new_job_listeners.each do |listener|
-                                listener.reset
-                                run_initial_new_job_hooks_events(listener, jobs)
-                            end
-                        else
-                            raise connection_future.reason
+                    case e = connection_future.reason
+                    when ConnectionError, ComError, ProtocolError
+                        Interface.info "failed connection attempt: #{e}"
+                        attempt_connection
+                        if @first_connection_attempt
+                            @first_connection_attempt = false
+                            run_hook :on_unreachable
                         end
+                        nil
+                    when NilClass
+                        Interface.info "successfully connected"
+                        @client = connection_future.value
+                        @client.io.reset_thread_guard
+                        @connection_future = nil
+                        @log_server_port = @client.handshake_results[:log_server_port]
+                        jobs = @client.handshake_results[:jobs].
+                            map do |job_id, (job_state, placeholder_task, job_task)|
+                                JobMonitor.new(self, job_id, state: job_state,
+                                    placeholder_task: placeholder_task, task: job_task)
+                            end
+                        run_hook :on_reachable, jobs
+                        new_job_listeners.each do |listener|
+                            listener.reset
+                            run_initial_new_job_hooks_events(listener, jobs)
+                        end
+                    else
+                        future, @connection_future = @connection_future, nil
+                        raise future.reason
                     end
                 end
 
@@ -189,7 +229,13 @@ module Roby
                         run_hook :on_notification, level, message
                     end
                     client.notification_queue.clear
+                    client.ui_event_queue.each do |id, event_name, *args|
+                        run_hook :on_ui_event, event_name, *args
+                    end
+                    client.ui_event_queue.clear
 
+                    finalized_monitors = Hash.new
+                    finalized_jobs = []
                     client.job_progress_queue.each do |id, (job_state, job_id, job_name, *args)|
                         new_job_listeners.each do |listener|
                             next if listener.seen_job_with_id?(job_id)
@@ -211,11 +257,16 @@ module Roby
                             end
                         end
 
+                        finalized_jobs << job_id if job_state == JOB_FINALIZED
+
                         if monitors = job_monitors[job_id]
                             monitors.each do |m|
                                 m.update_state(job_state)
                                 if job_state == JOB_REPLACED
                                     m.replaced(args.first)
+                                end
+                                if m.finalized?
+                                    (finalized_monitors[job_id] ||= Array.new) << m
                                 end
                             end
                         end
@@ -235,6 +286,22 @@ module Roby
                         run_hook :on_exception, kind, exception, tasks, job_ids
                     end
                     client.exception_queue.clear
+
+                    finalized_monitors.each do |job_id, monitors|
+                        active_monitors = job_monitors[job_id]
+                        monitors.each { |m| active_monitors.delete(m) }
+                        if active_monitors.empty?
+                            job_monitors.delete(job_id)
+                        end
+                    end
+
+                    finalized_jobs.each do |job_id|
+                        new_job_listeners.each { |l| l.clear_job_id(job_id) }
+                    end
+                end
+
+                def connecting?
+                    connection_future
                 end
 
                 def connected?
@@ -269,6 +336,32 @@ module Roby
                     false
                 end
 
+                # Blocking call that waits until calling #poll would do something
+                #
+                # @param [Numeric,nil] timeout a timeout after which the method
+                #   will return. Use nil for no timeout
+                # @return [Boolean] falsy if the timeout was reached, true
+                #   otherwise
+                def wait(timeout: nil)
+                    if connected?
+                        client.wait(timeout: timeout)
+                    else
+                        wait_connection_attempt_result(timeout: timeout)
+                    end
+                end
+
+                # Wait for the current connection attempt to finish
+                #
+                # @param [Numeric,nil] timeout a timeout after which the method
+                #   will return. Use nil for no timeout
+                # @return [Boolean] falsy if the timeout was reached, true
+                #   otherwise
+                def wait_connection_attempt_result(timeout: nil)
+                    connection_future.wait(timeout)
+                    connection_future.complete?
+                end
+
+
                 # Active part of the async. This has to be called regularly within
                 # the system's main event loop (e.g. Roby's, Vizkit's or Qt's)
                 #
@@ -278,7 +371,7 @@ module Roby
                     if connected?
                         poll_messages
                         true
-                    else
+                    elsif connecting?
                         poll_connection_attempt
                         !!client
                     end
@@ -287,7 +380,7 @@ module Roby
                 def unreachable!
                     job_monitors.each_value do |monitors|
                         monitors.each do |j|
-                            j.update_state(:finalized)
+                            j.update_state(:unreachable)
                         end
                     end
                     job_monitors.clear
@@ -295,12 +388,21 @@ module Roby
                     if client
                         client.close if !client.closed?
                         @client = nil
+                        @log_server_port = nil
                         run_hook :on_unreachable
                     end
                 end
 
-                def close
+                # Close the connection to the Roby interface
+                #
+                # @param [Boolean] reconnect if true, attempt to reconnect right
+                #   away. If false, the caller will be responsible to call
+                #   {#attempt_connection} before any future call to {#poll}
+                def close(reconnect: false)
                     unreachable!
+                    if reconnect
+                        attempt_connection
+                    end
                 end
 
                 # True if we are connected to a client
@@ -339,7 +441,7 @@ module Roby
                 #
                 # @param [String] action_name the action name
                 # @return [Array<JobMonitor>] the matching jobs
-                def find_all_jobs(action_name, jobs: jobs)
+                def find_all_jobs(action_name, jobs: self.jobs)
                     jobs.find_all do |job|
                         job.task.action_model.name == action_name
                     end
@@ -400,10 +502,17 @@ module Roby
                 end
 
                 def remove_job_monitor(job)
-                    set = job_monitors[job.job_id]
-                    set.delete(job)
-                    if set.empty?
-                        job_monitors.delete(job.job_id)
+                    if set = job_monitors[job.job_id]
+                        set.delete(job)
+                        if set.empty?
+                            job_monitors.delete(job.job_id)
+                        end
+                    end
+                end
+
+                def active_job_monitor?(job)
+                    if set = job_monitors[job.job_id]
+                        set.include?(job)
                     end
                 end
 
@@ -414,4 +523,3 @@ module Roby
         end
     end
 end
-

@@ -36,103 +36,114 @@ module Roby
     # different children, then they are merged with #merge to from one single
     # ExecutionException object.
     class ExecutionException
-	# The propagation trace. Because of forks and merges, this should be a
-	# graph.  We don't use graph properties (at least not yet), so consider
-	# this as the list of objects which did not handle the exeption. Only
-	# trace.last and trace.first have a definite meaning: the former
-	# is the last object(s) that handled the propagation and the latter
-	# is the object from which the exception originated. They can be 
-	# accessed through #task and #origin.
-	attr_reader :trace
-	# The last object(s) that handled the exception. This is either a
-	# single object or an array
-	def task; trace.last end
-	# The object from which the exception originates
-	def origin; trace.first end
+        # The trace of how this exception has been propagated in the plan so far
+        #
+        # @return [Relations::BidirectionalDirectedAdjacencyGraph]
+        attr_reader :trace
+
+        # The last object(s) that handled the exception. This is either a
+        # single object or an array
+        def propagation_leafs; trace.each_vertex.find_all { |v| trace.leaf?(v) } end
+        # The object from which the exception originates
+        def origin; @origin end
         # If true, the underlying exception is a fatal error, i.e. should cause
         # parent tasks to be stopped if unhandled.
         def fatal?; exception.fatal? end
     
-	# The origin EventGenerator if there is one
-	attr_reader :generator
-	# The exception object
-	attr_reader :exception
+        # The origin EventGenerator if there is one
+        attr_reader :generator
+        # The exception object
+        attr_reader :exception
 
-	# If this specific exception has been marked has handled
-	attr_accessor :handled
-	# If this exception has been marked as handled
-	def handled?
-	    handled
-	end
+        # If this specific exception has been marked has handled
+        attr_accessor :handled
+        # If this exception has been marked as handled
+        def handled?
+            handled
+        end
         # Enumerates all tasks that are involved in this exception (either
         # origin or in the trace)
-        def each_involved_task
-            return enum_for(:each_involved_task) if !block_given?
-            trace.each do |tr|
-                yield(tr)
-            end
+        def each_involved_task(&block)
+            return enum_for(__method__) if !block_given?
+            trace.each_vertex(&block)
+        end
+
+        def involved_task?(task)
+            trace.has_vertex?(task)
         end
 
         # Resets the trace to [origin]
         def reset_trace
-            @trace = [origin]
+            @trace = Relations::BidirectionalDirectedAdjacencyGraph.new
+            @trace.add_vertex(@origin)
         end
 
         # True if this exception originates from the given task or generator
         def originates_from?(object)
-            generator == object || task == object
+            generator == object || origin == object
         end
 
-	# Creates a new execution exception object with the specified source
-	# If +source+ is nil, tries to guess the source from +exception+: if
-	# +exception+ responds to #task or #generator we use either #task or
-	# call #generator.task
-	def initialize(exception)
-	    @exception = exception
-	    @trace = Array.new
+        # Creates a new execution exception object with the specified source
+        # If +source+ is nil, tries to guess the source from +exception+: if
+        # +exception+ responds to #task or #generator we use either #task or
+        # call #generator.task
+        def initialize(exception)
+            @exception = exception
+            @trace = Relations::BidirectionalDirectedAdjacencyGraph.new
 
-	    if task = exception.failed_task
-		@trace << exception.failed_task
-	    end
-	    if generator = exception.failed_generator
-		@generator = exception.failed_generator
-	    end
-
-	    if !task && !generator
-		raise ArgumentError, "invalid exception specification: cannot get the exception source"
-	    end
-	end
-
-	# Create a sibling from this exception
-	def fork
-	    dup
-	end
-
-	# Merges +sibling+ into this object
-	def merge(sibling)
-            new_trace = sibling.trace.find_all do |t|
-                !trace.include?(t)
+            if task = exception.failed_task
+                @origin = task
+                @trace.add_vertex(task)
             end
-            @trace = self.trace + new_trace
-            self
-	end
+            if generator = exception.failed_generator
+                @generator = exception.failed_generator
+            end
 
-	def initialize_copy(from)
-	    super
-	    @trace = from.trace.dup
-	end
+            if !task && !generator
+                raise ArgumentError, "invalid exception specification: cannot get the exception source"
+            end
+        end
+
+        # Create a sibling from this exception
+        def fork
+            dup
+        end
+
+        def propagate(from, to)
+            trace.add_edge(from, to)
+        end
+
+        # Merges +sibling+ into this object
+        #
+        # @param [Roby::Task] edge_source the source of the edge in sibling that
+        #   led to this merge
+        # @param [Roby::Task] edge_target the target of the edge in sibling that
+        #   led to this merge
+        def merge(sibling)
+            @trace.merge(sibling.trace)
+            self
+        end
+
+        def initialize_copy(from)
+            super
+            @trace = from.trace.dup
+        end
 
         def to_execution_exception
             self
+        end
+
+        def to_s
+            PP.pp(self, '')
         end
 
         def pretty_print(pp)
             pp.text "from #{origin} with trace "
             pp.nest(2) do
                 pp.nest(2) do
-                    trace.each do |t|
+                    trace.each_edge do |a, b, _|
                         pp.breakable
-                        pp.text t.to_s
+                        pp.text "#{a} => #{b}"
                     end
                 end
                 pp.breakable
@@ -158,40 +169,40 @@ module Roby
 
         # To be used in exception handlers themselves. Passes the exception to
         # the next matching exception handler
-	def pass_exception
-	    throw :next_exception_handler
-	end
-
-        def add_error(error)
-            execution_engine.add_error(error)
+        def pass_exception
+            throw :next_exception_handler
         end
 
-	# Calls the exception handlers defined in this task for +exception_object.exception+
-	# Returns true if the exception has been handled, false otherwise
-	def handle_exception(exception_object)
-	    each_exception_handler do |matcher, handler|
+        def add_error(error, propagate_through: nil)
+            execution_engine.add_error(error, propagate_through: propagate_through)
+        end
+
+        # Calls the exception handlers defined in this task for +exception_object.exception+
+        # Returns true if the exception has been handled, false otherwise
+        def handle_exception(exception_object)
+            each_exception_handler do |matcher, handler|
                 if exception_object.exception.kind_of?(FailedExceptionHandler)
                     # Do not handle a failed exception handler by itself
                     next if exception_object.exception.handler == handler
                 end
 
                 if matcher === exception_object
-		    catch(:next_exception_handler) do 
-			begin
-			    handler.call(self, exception_object)
-			    return true
-			rescue Exception => e
-			    if !kind_of?(PlanObject)
-				execution_engine.add_framework_error(e, 'global exception handling')
-			    else
-				add_error(FailedExceptionHandler.new(e, self, exception_object, handler))
-			    end
-			end
-		    end
-		end
-	    end
-	    return false
-	end
+                    catch(:next_exception_handler) do 
+                        begin
+                            handler.call(self, exception_object)
+                            return true
+                        rescue Exception => e
+                            if !kind_of?(PlanObject)
+                                execution_engine.add_framework_error(e, 'global exception handling')
+                            else
+                                add_error(FailedExceptionHandler.new(e, self, exception_object, handler))
+                            end
+                        end
+                    end
+                end
+            end
+            return false
+        end
     end
 
     def self.filter_backtrace(original_backtrace = nil, force: false, display_full_framework_backtraces: false)
@@ -208,7 +219,7 @@ module Roby
             end
         end
 
-	if (Roby.app.filter_backtraces? || force) && original_backtrace
+        if (Roby.app.filter_backtraces? || force) && original_backtrace
             app_dir = Roby.app.app_dir
 
             original_backtrace = original_backtrace.dup
@@ -267,8 +278,8 @@ module Roby
                 # The backtrace is only within the framework, make it empty
                 backtrace = []
             end
-	end
-	backtrace || original_backtrace || []
+        end
+        backtrace || original_backtrace || []
     end
 
     def self.pretty_print_backtrace(pp, backtrace, **options)
@@ -282,7 +293,7 @@ module Roby
         end
     end
 
-    def self.format_exception(exception)
+    def self.format_one_exception(exception)
         message = begin
                       PP.pp(exception, "")
                   rescue Exception => formatting_error
@@ -300,40 +311,82 @@ module Roby
         message.split("\n")
     end
 
-    def self.log_pp(obj, logger, level)
-        if logger.respond_to?(:logger)
-            logger = logger.logger
-        end
-
-        logger.send(level) do
-            first_line = true
-            format_exception(obj).each do |line|
-                if first_line
-                    line = color(line, :bold, :red)
-                    first_line = false
-                end
-                logger.send(level, line)
+    def self.format_exception(exception, with_original_exceptions: true)
+        message = format_one_exception(exception)
+        if with_original_exceptions && exception.respond_to?(:original_exceptions)
+            exception.original_exceptions.each do |original_e|
+                message.concat(format_exception(original_e, with_original_exceptions: true))
             end
-            break
+        end
+        message
+    end
+
+    LOG_SYMBOLIC_TO_NUMERIC = Array[
+        :debug,
+        :info,
+        :warn,
+        :error,
+        :fatal,
+        :unknown]
+
+    def self.log_level_enabled?(logger, level)
+        logger_level = if logger.respond_to?(:log_level)
+                           logger.log_level
+                       else logger.level
+                       end
+
+        if numeric_level = LOG_SYMBOLIC_TO_NUMERIC.index(level.to_sym)
+            logger_level <= numeric_level
+        else
+            raise ArgumentError, "#{level} is not a valid log level, log levels are #{LOG_SYMBOLIC_TO_NUMERIC.map(&:inspect).join(", ")}"
+        end
+    end
+
+    def self.log_pp(obj, logger, level)
+        return if !log_level_enabled?(logger, level)
+
+        message = begin
+                      PP.pp(obj, "")
+                  rescue Exception => formatting_error
+                      begin
+                          "error formatting object\n" +
+                              obj + "\nplease report the formatting error: \n" + 
+                              formatting_error.full_message
+                      rescue Exception => formatting_error
+                          "\nerror formatting object\n" +
+                              formatting_error.full_message
+                      end
+                  end
+
+        message.split("\n").each do |line|
+            logger.send(level, line)
         end
     end
 
     def self.log_exception(e, logger, level, with_original_exceptions: true)
-        log_pp(e, logger, level)
-        if with_original_exceptions && e.respond_to?(:original_exceptions)
-            e.original_exceptions.each do |original_e|
-                log_exception(original_e, logger, level, with_original_exceptions: true)
+        return if !log_level_enabled?(logger, level)
+
+        first_line = true
+        format_exception(e, with_original_exceptions: with_original_exceptions).each do |line|
+            if first_line
+                line = color(line, :bold, :red)
+                first_line = false
             end
+            logger.send(level, line)
         end
     end
 
-    def self.log_backtrace(e, logger, level, filter: Roby.app.filter_backtraces?)
+    def self.format_backtrace(e, filter: Roby.app.filter_backtraces?)
         backtrace = e.backtrace
         if filter
             backtrace = filter_backtrace(backtrace)
         end
 
-        format_exception(BacktraceFormatter.new(e, backtrace)).each do |line|
+        format_exception(BacktraceFormatter.new(e, backtrace))
+    end
+
+    def self.log_backtrace(e, logger, level, filter: Roby.app.filter_backtraces?)
+        format_backtrace(e, filter: filter).each do |line|
             logger.send(level, line)
         end
     end

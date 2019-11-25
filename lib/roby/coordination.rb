@@ -21,10 +21,12 @@ end
 
 require 'binding_of_caller'
 require 'roby/coordination/calculus'
+require 'roby/coordination/models/exceptions'
 require 'roby/coordination/models/task'
 require 'roby/coordination/models/event'
 require 'roby/coordination/models/root'
 require 'roby/coordination/models/variable'
+require 'roby/coordination/models/capture'
 require 'roby/coordination/models/child'
 require 'roby/coordination/models/arguments'
 require 'roby/coordination/models/base'

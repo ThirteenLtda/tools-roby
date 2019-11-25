@@ -5,6 +5,9 @@ module Roby
 end
 
 require 'roby/actions/models/action'
+require 'roby/actions/models/method_action'
+require 'roby/actions/models/coordination_action'
+require 'roby/actions/models/interface_base'
 require 'roby/actions/models/interface'
 require 'roby/actions/models/library'
 

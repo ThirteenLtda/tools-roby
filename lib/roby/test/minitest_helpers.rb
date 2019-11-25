@@ -1,3 +1,5 @@
+require 'roby/test/expect_execution'
+
 module Roby
     module Test
         # Handlers for minitest-based tests
@@ -5,6 +7,8 @@ module Roby
         # They mainly "tune" the default minitest behaviour to match some of the
         # Roby idioms as e.g. using pretty-print to format exception messages
         module MinitestHelpers
+            include ExpectExecution
+
             def roby_find_matching_exception(expected, exception)
                 queue = [exception]
                 seen  = Set.new
@@ -22,15 +26,24 @@ module Roby
                 nil
             end
 
-            def assert_raises(*exp, &block)
+            def assert_raises(*exp, display_exceptions: false, return_original_exception: false, &block)
                 if plan.executable?
                     # Avoid having it displayed by the execution engine. We're going
                     # to display any unexpected exception anyways
                     display_exceptions_enabled, plan.execution_engine.display_exceptions =
-                        plan.execution_engine.display_exceptions?, false
+                        plan.execution_engine.display_exceptions?, display_exceptions
                 end
 
                 msg = exp.pop if String === exp.last
+
+                matchers = exp.dup
+                exp = exp.map do |e|
+                    if e.kind_of?(Queries::LocalizedErrorMatcher)
+                        e.model
+                    else
+                        e
+                    end
+                end
 
                 # The caller expects a non-Roby exception. It is going to be
                 # wrapped in a LocalizedError, so make sure we properly
@@ -38,20 +51,24 @@ module Roby
                 begin
                     yield
                 rescue *exp => e
-                    assert_exception_can_be_pretty_printed(e)
-                    return e
-                rescue Roby::UserExceptionWrapper => wrapper_e
-                    assert_exception_can_be_pretty_printed(wrapper_e)
-                    all = Roby.flatten_exception(wrapper_e)
-                    if actual_e = all.find { |e| exp.any? { |expected_e| e.kind_of?(expected_e) } }
-                        return actual_e
+                    if matchers.any? { |m| m === e }
+                        assert_exception_can_be_pretty_printed(e)
+                        return e
+                    else
+                        flunk("#{matchers.map(&:to_s).join(", ")} exceptions expected, not #{e.class}")
+                    end
+                rescue ::Exception => root_e
+                    assert_exception_can_be_pretty_printed(root_e)
+                    all = Roby.flatten_exception(root_e)
+                    if actual_e = all.find { |e| matchers.any? { |expected_e| expected_e === e } }
+                        if return_original_exception
+                            return actual_e, root_e
+                        else
+                            return actual_e
+                        end
                     end
                     actually_caught = roby_exception_to_string(*all)
-                    flunk("#{exp.map(&:to_s).join(", ")} exceptions expected, not #{wrapper_e.class} #{actually_caught}")
-                rescue Exception => e
-                    assert_exception_can_be_pretty_printed(e)
-                    actually_caught = roby_exception_to_string(e)
-                    flunk("#{exp.map(&:to_s).join(", ")} exceptions expected, not #{e.class} #{actually_caught}")
+                    flunk("#{exp.map(&:to_s).join(", ")} exceptions expected, not #{root_e.class} #{actually_caught}")
                 end
                 flunk("#{exp.map(&:to_s).join(", ")} exceptions expected but received nothing")
 
@@ -94,35 +111,41 @@ module Roby
                 end
             end
 
+            def register_failure(e)
+                case e
+                when Assertion
+                    self.failures << e
+                else
+                    self.failures << Minitest::UnexpectedError.new(e)
+                end
+            end
+
             def capture_exceptions
                 super do
                     begin
                         yield
-                    rescue SynchronousEventProcessingMultipleErrors => aggregate_e
-                        exceptions = aggregate_e.errors.map do |execution_exception, _|
-                            execution_exception.exception
+                    rescue Exception => root_e
+                        if !root_e.respond_to?(:each_original_exception)
+                            raise
                         end
+
+                        exceptions = root_e.each_original_exception
+                        register_failure(root_e)
 
                         # Try to be smart and to only keep the toplevel
                         # exceptions
                         filter_execution_exceptions(exceptions).each do |e|
-                            case e
-                            when Assertion
-                                self.failures << e
-                            else
-                                self.failures << Minitest::UnexpectedError.new(e)
+                            if !e.backtrace
+                                e.set_backtrace(root_e.backtrace)
                             end
+                            register_failure(e)
                         end
                     end
                 end
             end
 
             def filter_execution_exceptions(exceptions)
-                included_in_another = exceptions.
-                    inject(Set.new) do |s, e|
-                        s.merge(Roby.flatten_exception(e) - [e])
-                    end
-                exceptions.find_all { |e| !included_in_another.include?(e) }
+                exceptions.flat_map { |e| Roby.flatten_exception(e).to_a }.uniq
             end
 
             def exception_details e, msg

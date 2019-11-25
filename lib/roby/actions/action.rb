@@ -9,7 +9,7 @@ module Roby
             # @return [Hash]
             attr_reader :arguments
 
-            def initialize(model, arguments = Hash.new)
+            def initialize(model, **arguments)
                 @model, @arguments = model, arguments
             end
 
@@ -17,13 +17,30 @@ module Roby
                 model.name
             end
 
+            def ==(other)
+                other.kind_of?(Action) &&
+                    model == other.model &&
+                    arguments == other.arguments
+            end
+
             # Update this object with new arguments and returns it
             #
             # @param [Hash] arguments new arguments
             # @return [self]
-            def with_arguments(arguments)
+            def with_arguments(**arguments)
                 @arguments.merge!(arguments)
                 self
+            end
+
+            def has_missing_required_arg?
+                model.arguments.any? do |arg|
+                    arg_sym = arg.name.to_sym
+                    if arguments.has_key?(arg_sym)
+                        TaskArguments.delayed_argument?(arguments.fetch(arg_sym))
+                    else
+                        arg.required?
+                    end
+                end
             end
 
             # The task model returned by this action
@@ -34,18 +51,16 @@ module Roby
             # Returns a plan pattern that would deploy this action in the plan
             # @return [Roby::Task] the task, with a planning task of type
             #   {Actions::Task}
-            def as_plan(arguments = Hash.new)
-                model.plan_pattern(self.arguments.merge(arguments))
+            def as_plan(**arguments)
+                model.plan_pattern(**self.arguments.merge(arguments))
             end
 
             def rebind(action_interface_model)
-                result = dup
-                result.model = result.model.rebind(action_interface_model)
-                result
+                model.rebind(action_interface_model).new(**arguments)
             end
 
             # Deploys this action on the given plan
-            def instanciate(plan, arguments = Hash.new)
+            def instanciate(plan, **arguments)
                 model.instanciate(plan, self.arguments.merge(arguments))
             end
 
@@ -55,14 +70,6 @@ module Roby
 
             def to_coordination_task(task_model = Roby::Task)
                 Coordination::Models::TaskFromAction.new(self)
-            end
-
-            # Returns the coordination model that defines the underlying action
-            # 
-            # @return (see Models::Action#to_coordination_model)
-            # @raise (see Models::Action#to_coordination_model)
-            def to_coordination_model
-                model.to_coordination_model
             end
 
             def to_action

@@ -20,7 +20,7 @@ module Roby
                 #
                 # @return [Model<Roby::Task>] the Roby task model, as a subclass
                 #   of Roby::Task
-                attr_reader :model
+                attr_accessor :model
 
                 # The task name
                 #
@@ -34,6 +34,19 @@ module Roby
                 #   either Roby::Task or one of its subclasses
                 def initialize(model)
                     @model = model
+                end
+
+                # Create a new coordination task based on a different
+                # coordination model
+                def rebind(coordination_model)
+                    dup
+                end
+
+                # @api private
+                #
+                # Used in {Base#rebind} to update the internal relationships
+                # between coordination tasks
+                def map_tasks(mapping)
                 end
 
                 # Returns an instance-level coordination task that can be used
@@ -134,15 +147,32 @@ module Roby
                     end
                 end
 
-                # Allows to access events and children using the _child and
-                # _event suffixes
-                def method_missing(m, *args, &block)
-                    MetaRuby::DSLs.find_through_method_missing(self, m, args, 'event', 'child') ||
+                def find_through_method_missing(m, args)
+                    MetaRuby::DSLs.find_through_method_missing(
+                        self, m, args,
+                        '_event' => :find_event,
+                        '_child' => :find_child) ||
                         super
                 end
 
+                def has_through_method_missing?(m)
+                    MetaRuby::DSLs.has_through_method_missing?(
+                        self, m,
+                        '_event' => :has_event?,
+                        '_child' => :has_child?) ||
+                        super
+                end
+
+                include MetaRuby::DSLs::FindThroughMethodMissing
+
                 def to_coordination_task(task_model = Roby::Task)
                     self
+                end
+
+                # This method must be overloaded in the tasks that will be
+                # actually used in the coordination primitives
+                def instanciate(plan, variables = Hash.new)
+                    raise NotImplementedError, "must reimplement #instanciate in the task objects used in coordination primitives"
                 end
 
                 def setup_instanciated_task(coordination_context, task, arguments = Hash.new)

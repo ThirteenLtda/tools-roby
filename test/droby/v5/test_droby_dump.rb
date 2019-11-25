@@ -32,6 +32,14 @@ module Roby
                 end
                 let(:remote_plan) { Roby::ExecutablePlan.new }
 
+                def execute(plan: local_plan, **options)
+                    super
+                end
+
+                def expect_execution(plan: local_plan, **options)
+                    super
+                end
+
                 def create_task_pair
                     local_plan.add(task  = Roby::Task.new)
                     marshaller_object_manager.register_object(task)
@@ -45,6 +53,19 @@ module Roby
                 def transfer(obj)
                     droby_unmarshalled = ::Marshal.load(::Marshal.dump(marshaller.dump(obj)))
                     demarshaller.local_object(droby_unmarshalled)
+                end
+
+                describe BidirectionalGraphDumper do
+                    it "dumps and reloads objects, edges and information" do
+                        graph = Relations::BidirectionalDirectedAdjacencyGraph.new
+                        task_a, remote_a = create_task_pair
+                        task_b, remote_b = create_task_pair
+                        graph.add_edge(task_a, task_b, Hash[v: 10])
+                        graph.add_edge(task_a.start_event, task_b.stop_event, Hash[v: 42])
+                        remote_g = transfer(graph)
+                        assert_equal Hash[v: 10], remote_g.edge_info(remote_a, remote_b)
+                        assert_equal Hash[v: 42], remote_g.edge_info(remote_a.start_event, remote_b.stop_event)
+                    end
                 end
 
                 describe Models::TaskDumper do
@@ -64,6 +85,38 @@ module Roby
                         marshalled = marshaller.dump(task_m)
                         loaded = demarshaller.local_object(marshalled)
                         assert_same loaded, demarshaller.local_object(marshalled)
+                    end
+
+                    it "resolves its default arguments" do
+                        other_m = Roby::Task.new_submodel(name: 'Argument')
+                        task_m = Roby::Task.new_submodel(name: 'Test')
+                        task_m.argument :test, default: other_m
+
+                        remote_m = transfer(task_m)
+                        assert_same remote_m.find_argument(:test).default.value, transfer(other_m)
+                    end
+
+                    it "resolves a model by name" do
+                        task_m = Roby::Task.new_submodel(name: 'Test')
+                        remote_m = Roby::Task.new_submodel(name: 'RemoteTest')
+                        flexmock(demarshaller).should_receive(:find_local_model).with(->(m) { m.name == 'Test' }).and_return(remote_m)
+                        flexmock(demarshaller).should_receive(:find_local_model).pass_thru
+
+                        transferred = transfer(task_m)
+                        assert_same remote_m, transferred
+                    end
+
+                    it "loads objects within its default arguments even if the model can be resolved by name" do
+                        other_m = Roby::Task.new_submodel(name: 'RemoteTest')
+                        task_m = Roby::Task.new_submodel(name: 'Test')
+                        task_m.argument :test, default: other_m
+                        remote_m = Roby::Task.new_submodel(name: 'RemoteTest')
+                        flexmock(demarshaller).should_receive(:find_local_model).with(->(m) { m.name == 'Test' }).and_return(remote_m)
+                        flexmock(demarshaller).should_receive(:find_local_model).pass_thru
+                        flexmock(demarshaller).should_receive(:local_object).with(V5::DefaultArgumentDumper::DRoby).once
+                        flexmock(demarshaller).should_receive(:local_object).pass_thru
+
+                        transfer(task_m)
                     end
 
                     it "replicates the model's arguments" do
@@ -95,6 +148,22 @@ module Roby
                         # by ID
                         assert_same loaded, demarshaller.local_object(marshalled)
                     end
+
+                    it "registers its model" do
+                        task_m = Roby::Task.new_submodel
+                        task = task_m.new
+                        droby_transfer(task_m.new)
+                        assert_kind_of Roby::DRoby::RemoteDRobyID,
+                            droby_local_marshaller.dump(task_m)
+                    end
+
+                    it "handles a model that is also referenced in its arguments" do
+                        task_m = Roby::Task.new_submodel
+                        task_m.argument :arg
+                        task = task_m.new(arg: task_m)
+                        remote = droby_transfer task
+                        assert_same remote.class, remote.arg
+                    end
                 end
 
                 describe "marshalling and demarshalling of plan objects" do
@@ -118,7 +187,7 @@ module Roby
 
                         it "replicates the cached emitted flag" do
                             ev = EventGenerator.new(plan: local_plan)
-                            ev.emit
+                            execute { ev.emit }
                             ev = transfer(ev)
                             assert ev.emitted?
                         end
@@ -157,23 +226,27 @@ module Roby
 
                         it "replicates the cached started status" do
                             local_plan.add(task = task_m.new)
-                            task.start!
+                            execute { task.start! }
                             task = transfer(task)
                             assert task.running?
                         end
 
                         it "replicates the cached finished status" do
                             local_plan.add(task = task_m.new)
-                            task.start!
-                            task.stop!
+                            execute do
+                                task.start!
+                                task.stop!
+                            end
                             task = transfer(task)
                             assert task.finished?
                         end
 
                         it "replicates the cached success status" do
                             local_plan.add(task = task_m.new)
-                            task.start!
-                            task.success_event.emit
+                            execute do
+                                task.start!
+                                task.success_event.emit
+                            end
                             task = transfer(task)
                             assert task.success?
                         end
@@ -237,7 +310,7 @@ module Roby
 
                         it "duplicates the event's emitted status" do
                             local_plan.add(task = Roby::Task.new_submodel.new)
-                            task.start_event.emit
+                            execute { task.start_event.emit }
                             remote_event = transfer(task.start_event)
                             assert remote_event.emitted?
                         end
@@ -366,14 +439,13 @@ module Roby
                     it "is droby-marshallable" do
                         task, r_task= create_task_pair
                         parent_task, r_parent_task = create_task_pair
-                        e = LocalizedError.new(task.start_event)
-                        ee = ExecutionException.new(e)
-                        ee.trace << parent_task
+                        ee = LocalizedError.new(task.start_event).to_execution_exception
+                        ee.propagate(task, parent_task)
                         ee.handled = true
 
                         ee = transfer(ee)
                         assert_equal r_task.start_event, ee.exception.failure_point
-                        assert_equal [r_task, r_parent_task], ee.trace
+                        assert_equal [[r_task, r_parent_task, nil]], ee.trace.each_edge.to_a
                         assert ee.handled?
                     end
                 end
@@ -388,6 +460,18 @@ module Roby
                         assert_equal r_planned_t, e.planned_task
                         assert_equal r_planning_t, e.planning_task
                         assert_equal 42, e.failure_reason
+                    end
+                end
+
+                describe DefaultArgumentDumper do
+                    it "transfers the default argument value" do
+                        local = Roby::Task.new_submodel
+                        obj = DefaultArgument.new(local)
+                        arg = Roby::DefaultArgument.new(local)
+
+                        remote_arg = droby_transfer(arg)
+                        assert_kind_of Roby::DefaultArgument, remote_arg
+                        assert_same droby_transfer(local), remote_arg.value
                     end
                 end
 
@@ -427,7 +511,7 @@ module Roby
                             marshaller.register_model(task_m)
                             demarshaller.register_model(interface_m)
 
-                            action = interface_m.an_action('test' => task_m)
+                            action = interface_m.an_action(test: task_m)
                             loaded = transfer(action)
                             assert_same action.model, loaded.model
                             assert_equal task_m.droby_id, demarshaller_object_manager.known_sibling_on(
@@ -451,7 +535,7 @@ module Roby
                                 assert_same action_m, loaded
                             end
 
-                            it "can marshal actions with non trivial default arguments" do
+                            it "marshals actions with non trivial default arguments" do
                                 task_m = Roby::Task.new_submodel(name: 'Test')
                                 interface_m = Roby::Actions::Interface.new_submodel do
                                     describe('action').
@@ -536,10 +620,10 @@ module Roby
                             matcher.neg_predicates << :c
                             matcher.indexed_neg_predicates << :d
                             matcher = transfer(self.matcher)
-                            assert_equal Set[:a], matcher.predicates
-                            assert_equal Set[:b], matcher.indexed_predicates
-                            assert_equal Set[:c], matcher.neg_predicates
-                            assert_equal Set[:d], matcher.indexed_neg_predicates
+                            assert_equal [:a], matcher.predicates
+                            assert_equal [:b], matcher.indexed_predicates
+                            assert_equal [:c], matcher.neg_predicates
+                            assert_equal [:d], matcher.indexed_neg_predicates
                         end
 
                         describe "relation matching" do
@@ -557,7 +641,7 @@ module Roby
                                 matcher.with_child(task_m, Roby::TaskStructure::Dependency,
                                                    flexmock(droby_dump: 42))
                                 flexmock(demarshaller).should_receive(:local_object).with(42).and_return(Hash.new).once
-                                flexmock(demarshaller).should_receive(:local_object).with(any).pass_thru
+                                flexmock(demarshaller).should_receive(:local_object).with(any, any).pass_thru
                                 matcher = transfer(self.matcher)
 
                                 edges = matcher.children.fetch(Roby::TaskStructure::Dependency)
@@ -570,7 +654,7 @@ module Roby
                                 matcher.with_parent(task_m, Roby::TaskStructure::Dependency,
                                                     flexmock(droby_dump: 42))
                                 flexmock(demarshaller).should_receive(:local_object).with(42).and_return(Hash.new).once
-                                flexmock(demarshaller).should_receive(:local_object).with(any).pass_thru
+                                flexmock(demarshaller).should_receive(:local_object).with(any, any).pass_thru
                                 matcher = transfer(self.matcher)
 
                                 edges = matcher.parents.fetch(Roby::TaskStructure::Dependency)

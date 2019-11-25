@@ -17,6 +17,19 @@ describe Roby::Interface::Interface do
         job_task_m.provides Roby::Interface::Job
     end
 
+    describe "#initialize" do
+        it "can be created on a plan that contains jobs already" do
+            app = Roby::Application.new
+            task = Roby::Task.new
+            task.planned_by(job = @job_task_m.new(job_id: 10))
+            app.plan.add(task)
+            flexmock(Roby::Interface::Interface).new_instances.
+                should_receive(:monitor_job).with(job, task, new_task: true).
+                once.pass_thru
+            Roby::Interface::Interface.new(app)
+        end
+    end
+
     describe "#actions" do
         it "should list existing actions" do
             actions = Roby::Actions::Interface.new_submodel do
@@ -44,12 +57,12 @@ describe Roby::Interface::Interface do
             plan.add(job_task = job_task_m.new(job_id: nil))
             plan.add(planned_task = Roby::Task.new)
             planned_task.planned_by job_task
-            assert_equal nil, interface.job_id_of_task(job_task)
-            assert_equal nil, interface.job_id_of_task(planned_task)
+            assert_nil interface.job_id_of_task(job_task)
+            assert_nil interface.job_id_of_task(planned_task)
         end
         it "should return nil for plain tasks" do
             plan.add(plain = Roby::Task.new)
-            assert_equal nil, interface.job_id_of_task(plain)
+            assert_nil interface.job_id_of_task(plain)
         end
     end
 
@@ -76,7 +89,7 @@ describe Roby::Interface::Interface do
             assert_equal job_task, interface.find_job_by_id(10)
         end
         it "should return nil if no job with the given ID exists" do
-            assert_equal nil, interface.find_job_by_id(10)
+            assert_nil interface.find_job_by_id(10)
         end
     end
 
@@ -87,14 +100,57 @@ describe Roby::Interface::Interface do
             plan.add_mission_task(@task = Roby::Tasks::Simple.new)
             task.planned_by job_task
             flexmock(job_task).should_receive(:job_name).and_return("the job")
-            @recorder = flexmock
+            @recorder = Array.new
             @job_listener = interface.on_job_notification do |event, id, name, *args|
-                recorder.called(event, id, name, *args)
+                recorder << [event, id, name, *args]
             end
         end
 
         after do
             interface.remove_job_listener(job_listener)
+        end
+
+        def assert_queued_notifications(*expected_notifications, strict: false)
+            expected_notifications.each_with_index do |expected, i|
+                queued = interface.job_notifications[i]
+                if !queued
+                    flunk "expected notification #{i} to be #{expected.inspect}\n"\
+                        "but there was none"
+                elsif !expected.each_with_index.all? { |v, v_i| v === queued[v_i] }
+                    flunk "expected notification #{i} to be #{expected.inspect}\n"\
+                        "but got #{queued.inspect}"
+                end
+            end
+            if strict
+                assert_equal expected_notifications.size,
+                    interface.job_notifications.size,
+                    "the extra notifications are: "\
+                    "#{interface.job_notifications[expected_notifications.size..-1]}"
+            end
+        end
+
+        def assert_received_notifications(*expected_notifications, strict: false)
+            expected_notifications.each_with_index do |expected, i|
+                if !recorder[i]
+                    flunk "expected notification #{i} to be #{expected.inspect}\n"\
+                        "but there was none"
+                elsif !expected.each_with_index.all? { |v, v_i| v === recorder[i][v_i] }
+                    flunk "expected notification #{i} to be #{expected.inspect}\n"\
+                        "but got #{recorder[i].inspect}"
+                end
+            end
+            if strict
+                assert_equal expected_notifications.size,
+                    recorder.size,
+                    "the extra notifications are: "\
+                    "#{interface.job_notifications[expected_notifications.size..-1]}"
+            end
+        end
+
+        def assert_queued_and_received_notifications(*expected, strict: false)
+            assert_queued_notifications(*expected, strict: strict)
+            interface.push_pending_notifications
+            assert_received_notifications(*expected, strict: strict)
         end
 
         it "starts notifications when starting a job" do
@@ -105,134 +161,325 @@ describe Roby::Interface::Interface do
                 task.planned_by(job_task)
                 [nil, flexmock(plan_pattern: task)]
             end
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 11, any, any, any).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 11, any).once.ordered
             interface.start_job(:whatever)
-            interface.push_pending_job_notifications
+            assert_queued_and_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 11, any, any, any],
+                [Roby::Interface::JOB_PLANNING_READY, 11, any]
         end
 
-        it "should notify of job state changes" do
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_STARTED, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_SUCCESS, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_FINALIZED, 10, "the job").once.ordered
+        it "starts notifications when the job is added from within a transaction" do
+            task = Roby::Tasks::Simple.new
+            task.planned_by(job_task_m.new(job_id: 11))
+            plan.in_transaction do |trsc|
+                trsc.add_mission_task(task)
+                trsc.commit_transaction
+            end
+            assert_queued_and_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 11, any, any, any],
+                [Roby::Interface::JOB_PLANNING_READY, 11, any]
+        end
 
-            interface.monitor_job(task.planning_task, task)
-            job_task.start!
-            job_task.success_event.emit
-            task.start!
-            task.success_event.emit
-            plan.remove_task(task)
-            interface.push_pending_job_notifications
+        it "notifies of nominal job state changes" do
+            interface.monitor_job(job_task, task)
+            expect_execution do
+                job_task.start!
+                job_task.success_event.emit
+            end.to_run
+            expect_execution do
+                task.start!
+                task.success_event.emit
+            end.to_run
+            expect_execution { plan.remove_task(task) }.to_run
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_PLANNING, 10, "the job"],
+                [Roby::Interface::JOB_READY, 10, "the job"],
+                [Roby::Interface::JOB_STARTED, 10, "the job"],
+                [Roby::Interface::JOB_SUCCESS, 10, "the job"],
+                [Roby::Interface::JOB_FINALIZED, 10, "the job"]
         end
 
         it "notifies of planning failures" do
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_FAILED, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_FINALIZED, 10, "the job").once.ordered
-            interface.monitor_job(task.planning_task, task)
-            job_task.start!
-            inhibit_fatal_messages do
-                assert_raises(Roby::PlanningFailedError) { job_task.failed_event.emit }
-            end
-            interface.push_pending_job_notifications
+            interface.monitor_job(job_task, task)
+            expect_execution { job_task.start! }.to_run
+            expect_execution { job_task.failed_event.emit }.
+                garbage_collect(true).to { have_error_matching Roby::PlanningFailedError }
+            interface.push_pending_notifications
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_PLANNING, 10, "the job"],
+                [Roby::Interface::JOB_PLANNING_FAILED, 10, "the job"],
+                [Roby::Interface::JOB_FINALIZED, 10, "the job"]
         end
 
-        it "should notify of placeholder task change" do
+        it "notifies of placeholder task replacement" do
             plan.add(new_task = Roby::Tasks::Simple.new(id: task.id))
             new_task.planned_by job_task
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_REPLACED, 10, "the job", new_task).once.ordered
 
-            interface.monitor_job(task.planning_task, task)
+            interface.monitor_job(job_task, task)
             plan.replace_task(task, new_task)
-            interface.push_pending_job_notifications
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_REPLACED, 10, "the job", new_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"]
+        end
+
+        it "notifies of placeholder replacement done within a transaction" do
+            interface.monitor_job(job_task, task)
+
+            new_task = Roby::Tasks::Simple.new(id: task.id)
+            plan.in_transaction do |trsc|
+                new_task.planned_by trsc[job_task]
+                trsc.replace_task(trsc[task], new_task)
+                trsc.commit_transaction
+            end
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_REPLACED, 10, "the job", new_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                strict: true
+        end
+
+        describe "behavior when a whole job is replaced" do
+            # Actions::Task will forward a job ID when the result of the action
+            # is itself a plan pattern. This makes sense to improve the overall
+            # UI behavior, and is common within Syskit as an action method can
+            # return a Syskit plan pattern
+            #
+            # Check the job tracking behavior when this happens
+
+            it "tracks the replacement" do
+                interface.monitor_job(job_task, task)
+
+                new_task = Roby::Tasks::Simple.new(id: task.id)
+                new_job_task = job_task_m.new(job_id: 10)
+                plan.in_transaction do |trsc|
+                    new_task.planned_by new_job_task
+                    trsc.replace_task(trsc[task], new_task)
+                    trsc.commit_transaction
+                end
+                interface.push_pending_notifications
+
+                assert_received_notifications \
+                    [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                    [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                    [Roby::Interface::JOB_REPLACED, 10, "the job", new_task],
+                    [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                    strict: true
+            end
+
+            it "ignores the first planning task's end" do
+                interface.monitor_job(job_task, task)
+                expect_execution { job_task.start! }.to_run
+
+                new_task = Roby::Tasks::Simple.new(id: task.id)
+                new_job_task = job_task_m.new(job_id: 10)
+                plan.in_transaction do |trsc|
+                    new_task.planned_by new_job_task
+                    trsc.replace(trsc[task], new_task)
+                    trsc.commit_transaction
+                end
+                expect_execution { job_task.success_event.emit }.
+                    garbage_collect(true).
+                    to { finalize job_task }
+                interface.push_pending_notifications
+
+                assert_received_notifications \
+                    [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                    [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                    [Roby::Interface::JOB_PLANNING, 10, "the job"],
+                    [Roby::Interface::JOB_REPLACED, 10, "the job", new_task],
+                    [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                    strict: true
+            end
+
+            it "supports the workflow of Actions::Task" do
+                interface_m = Roby::Actions::Interface.new_submodel do
+                    class Ret < Roby::Task
+                    end
+                    describe('test method').
+                        returns(Ret)
+                    def test_method
+                        self.class.other_planning_method
+                    end
+
+                    describe('test method').
+                        returns(Ret)
+                    def other_planning_method
+                        Ret.new(id: 20)
+                    end
+                end
+                plan.add_mission_task(action_task = interface_m.test_method.
+                    as_plan(job_id: 10))
+                action_task_planner = action_task.planning_task
+                expect_execution { action_task_planner.start! }.
+                    to { emit action_task_planner.success_event }
+                result_task = action_task_planner.planning_result_task
+                result_task_planner = result_task.planning_task
+                expect_execution { result_task_planner.start! }.
+                    garbage_collect(true).
+                    to { emit result_task_planner.success_event }
+                final_task = result_task_planner.planning_result_task
+
+                assert_received_notifications \
+                    [Roby::Interface::JOB_MONITORED, 10, ".test_method()", action_task, action_task_planner],
+                    [Roby::Interface::JOB_PLANNING_READY, 10, ".test_method()"],
+                    [Roby::Interface::JOB_PLANNING, 10, ".test_method()"],
+                    [Roby::Interface::JOB_REPLACED, 10, ".test_method()", result_task],
+                    [Roby::Interface::JOB_PLANNING_READY, 10, ".test_method()"],
+                    [Roby::Interface::JOB_PLANNING, 10, ".test_method()"],
+                    [Roby::Interface::JOB_REPLACED, 10, ".test_method()", final_task],
+                    [Roby::Interface::JOB_PLANNING, 10, ".test_method()"],
+                    [Roby::Interface::JOB_READY, 10, ".test_method()"],
+                    strict: true
+            end
         end
 
 
-        it "does not send a drop notification when a replacement is done in a transaction" do
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_REPLACED, 10, "the job", any).once.ordered
+        it "notifies the current state of the new placeholder task" do
+            plan.add(new_task = Roby::Tasks::Simple.new(id: task.id))
+            new_task.planned_by job_task
+            expect_execution { new_task.start! }.to_run
 
-            interface.monitor_job(task.planning_task, task)
+            interface.monitor_job(job_task, task)
+            plan.replace_task(task, new_task)
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_REPLACED, 10, "the job", new_task],
+                [Roby::Interface::JOB_STARTED, 10, "the job"]
+        end
+
+        it "notifies the current state of the new placeholder task" do
+            plan.add(new_task = Roby::Tasks::Simple.new(id: task.id))
+            new_task.planned_by job_task
+            expect_execution { new_task.start! }.to_run
+
+            interface.monitor_job(job_task, task)
+            plan.replace_task(task, new_task)
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_REPLACED, 10, "the job", new_task],
+                [Roby::Interface::JOB_STARTED, 10, "the job"]
+        end
+
+        it "does not send a drop notification when a replacement is done in a transaction" do
+            interface.monitor_job(job_task, task)
             plan.in_transaction do |t|
                 t.add(new_task = Roby::Tasks::Simple.new(id: task.id))
                 new_task.planned_by t[job_task]
                 t.replace(t[task], new_task)
                 t.commit_transaction
             end
-            interface.push_pending_job_notifications
+            interface.push_pending_notifications
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_REPLACED, 10, "the job", any]
         end
 
         it "notifies if a job is dropped" do
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_DROPPED, 10, "the job").once.ordered
-
-            interface.monitor_job(task.planning_task, task)
+            interface.monitor_job(job_task, task)
             plan.unmark_mission_task(task)
-            interface.push_pending_job_notifications
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_DROPPED, 10, "the job"]
         end
 
-        it "does not send further notifications if a job has been dropped" do
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_DROPPED, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING, 10, "the job").never
-
-            interface.monitor_job(task.planning_task, task)
+        it "does not send non-FINALIZED notifications if a job has been dropped" do
+            interface.monitor_job(job_task, task)
             plan.unmark_mission_task(task)
-            interface.push_pending_job_notifications
-            job_task.start!
-            job_task.success_event.emit
-            interface.push_pending_job_notifications
+            interface.push_pending_notifications
+            expect_execution do
+                job_task.start!
+                job_task.success_event.emit
+            end.to_run
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_DROPPED, 10, "the job"]
+        end
+
+        it "does send FINALIZED even if a job has been dropped" do
+            interface.monitor_job(job_task, task)
+            plan.unmark_mission_task(task)
+            interface.push_pending_notifications
+            execute do
+                job_task.start!
+                job_task.success_event.emit
+            end
+            interface.push_pending_notifications
+            execute { plan.remove_task(job_task) }
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_DROPPED, 10, "the job"],
+                [Roby::Interface::JOB_FINALIZED, 10, "the job"]
         end
 
         it "recaptures a job" do
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_DROPPED, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING, 10, "the job").never
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_READY, 10, "the job").once.ordered
-
-            interface.monitor_job(task.planning_task, task)
+            interface.monitor_job(job_task, task)
             plan.unmark_mission_task(task)
-            interface.push_pending_job_notifications
-            job_task.start!
-            job_task.success_event.emit
-            interface.push_pending_job_notifications
+            interface.push_pending_notifications
+            expect_execution do
+                job_task.start!
+                job_task.success_event.emit
+            end.to_run
+            interface.push_pending_notifications
             plan.add_mission_task(task)
-            interface.push_pending_job_notifications
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_DROPPED, 10, "the job"],
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_READY, 10, "the job"]
         end
 
         it "disable notifications if the replacement task has not the same job ID" do
             plan.add(new_task = Roby::Tasks::Simple.new(id: task.id))
-            recorder.should_receive(:called).with(Roby::Interface::JOB_MONITORED, 10, "the job", task, task.planning_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_PLANNING_READY, 10, "the job").once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_LOST, 10, "the job", new_task).once.ordered
-            recorder.should_receive(:called).with(Roby::Interface::JOB_STARTED, 10, "the job").never
-
-            interface.monitor_job(task.planning_task, task)
+            interface.monitor_job(job_task, task)
             plan.replace(task, new_task)
-            interface.push_pending_job_notifications
-            task.start!
-            new_task.start!
-            interface.push_pending_job_notifications
+            interface.push_pending_notifications
+            expect_execution do
+                task.start!
+                new_task.start!
+            end.to_run
+            interface.push_pending_notifications
+
+            assert_received_notifications \
+                [Roby::Interface::JOB_MONITORED, 10, "the job", task, job_task],
+                [Roby::Interface::JOB_PLANNING_READY, 10, "the job"],
+                [Roby::Interface::JOB_LOST, 10, "the job", new_task]
         end
 
         it "allows to remove a listener completely" do
-            recorder.should_receive(:called).never
-            interface.monitor_job(task.planning_task, task)
+            interface.monitor_job(job_task, task)
             interface.remove_job_listener(job_listener)
-            task.start!
+            expect_execution { task.start! }.to_run
+            assert recorder.empty?
         end
     end
 
@@ -241,35 +488,62 @@ describe Roby::Interface::Interface do
         before do
             plan.add(@parent_task = Roby::Tasks::Simple.new)
             plan.add(@child_task = Roby::Tasks::Simple.new)
-            parent_task.depends_on child_task
-            parent_task.start!
-            child_task.start!
-            @recorder = flexmock
+            @messages = []
             @exception_listener = interface.on_exception do |*args|
-                recorder.called(*args)
+                @messages << args
             end
+            execution_engine.display_exceptions = false
         end
 
-        it "should call the handlers with the generated exception" do
-            exception_validator = lambda do |error|
-                error.origin == child_task && error.exception.class == Roby::ChildFailedError
+        after do
+            execution_engine.display_exceptions = true
+        end
+
+        it "calls the notification handlers when the engine notifies about an exception" do
+            localized_error_m = Class.new(Roby::LocalizedError)
+            exception = localized_error_m.new(child_task).to_execution_exception
+            execution_engine.notify_exception(Roby::ExecutionEngine::EXCEPTION_FATAL,
+                exception, Set[parent_task, child_task])
+            interface.push_pending_notifications
+            assert_equal [[Roby::ExecutionEngine::EXCEPTION_FATAL,
+                     exception, Set[child_task, parent_task], Set.new]], @messages
+        end
+
+        it "queues the exception notifications and sends them after the job" do
+            localized_error_m = Class.new(Roby::LocalizedError)
+            exception = localized_error_m.new(child_task).to_execution_exception
+            interface.on_job_notification do |*args|
+                @messages << args
             end
-            recorder.should_receive(:called).with(Roby::ExecutionEngine::EXCEPTION_FATAL, exception_validator, [child_task, parent_task])
-            inhibit_fatal_messages do
-                assert_raises(Roby::ChildFailedError) do
-                    child_task.stop!
-                end
-            end
+            interface.job_notify(Roby::Interface::JOB_MONITORED, 42, 'name')
+            interface.job_notify(Roby::Interface::JOB_READY, 42, 'name')
+            interface.job_notify(Roby::Interface::JOB_STARTED, 42, 'name')
+            interface.job_notify(Roby::Interface::JOB_FAILED, 42, 'name')
+            execution_engine.notify_exception(Roby::ExecutionEngine::EXCEPTION_FATAL,
+                exception, Set[parent_task, child_task])
+            interface.job_notify(Roby::Interface::JOB_FINALIZED, 42, 'name')
+            interface.push_pending_notifications
+
+            expected = [
+                [Roby::Interface::JOB_MONITORED, 42, 'name'],
+                [Roby::Interface::JOB_READY, 42, 'name'],
+                [Roby::Interface::JOB_STARTED, 42, 'name'],
+                [Roby::Interface::JOB_FAILED, 42, 'name'],
+                [Roby::Interface::JOB_FINALIZED, 42, 'name'],
+                [Roby::ExecutionEngine::EXCEPTION_FATAL,
+                     exception, Set[child_task, parent_task], Set.new]
+            ]
+            assert_equal expected, @messages
         end
 
         it "allows to remove a listener" do
-            recorder.should_receive(:called).never
+            localized_error_m = Class.new(Roby::LocalizedError)
+            exception = localized_error_m.new(child_task).to_execution_exception
             interface.remove_exception_listener(exception_listener)
-            inhibit_fatal_messages do
-                assert_raises(Roby::ChildFailedError) do
-                    child_task.stop!
-                end
-            end
+            execution_engine.notify_exception(Roby::ExecutionEngine::EXCEPTION_FATAL,
+                exception, Set[parent_task, child_task])
+            interface.push_pending_notifications
+            assert_equal [], @messages
         end
     end
 
@@ -291,33 +565,54 @@ describe Roby::Interface::Interface do
             assert !plan.mission_task?(task)
         end
         it "forcefully stops a running job" do
-            task.start!
-            interface.kill_job 10
-            assert task.finished?
+            expect_execution { task.start! }.to_run
+            expect_execution { interface.kill_job 10 }.
+                to { emit task.stop_event }
         end
     end
 
     describe "#drop_job" do
         attr_reader :task
         before do
-            plan.add(job_task = job_task_m.new(job_id: 10))
+            plan.add(@job_task = job_task_m.new(job_id: 10))
             plan.add_mission_task(@task = Roby::Tasks::Simple.new)
-            task.planned_by job_task
+            task.planned_by @job_task
         end
         it "returns true for an existing job" do
             assert interface.drop_job(10)
         end
         it "returns false for a non-existent job" do
-            assert !interface.drop_job(20)
+            refute interface.drop_job(20)
+        end
+        it "removes the planning task relation" do
+            interface.drop_job(10)
+            assert_equal [], task.each_planning_task.to_a
         end
         it "unmarks the job as mission" do
             interface.drop_job 10
-            assert !plan.mission_task?(task)
+            refute plan.mission_task?(task)
         end
         it "does not stops a running job" do
-            task.start!
+            expect_execution { task.start! }.to_run
             interface.drop_job 10
             assert task.running?
+        end
+
+        describe "multiple planning tasks" do
+            before do
+                @other_job_task = job_task_m.new(job_id: 20)
+                task.add_planning_task @other_job_task
+            end
+
+            it "does not unmark as mission" do
+                interface.drop_job 10
+                assert plan.mission_task?(task)
+            end
+
+            it "does remove the planning relation" do
+                interface.drop_job 10
+                assert_equal [@other_job_task], task.each_planning_task.to_a
+            end
         end
     end
 
@@ -372,6 +667,26 @@ describe Roby::Interface::Interface do
         end
     end
 
+    describe "UI event handlers" do
+        it "registers a new handler for UI events" do
+            recorder = flexmock
+            recorder.should_receive(:called).with(:test_event, [0, 2, 3]).once
+            interface.on_ui_event do |event, *args|
+                recorder.called(event, args)
+            end
+            app.ui_event(:test_event, 0, 2, 3)
+        end
+        it "#remove_notification_listener removes a registered notification handler" do
+            recorder = flexmock
+            recorder.should_receive(:called).never
+            id = interface.on_ui_event do |event, *args|
+                recorder.called
+            end
+            interface.remove_ui_event_listener(id)
+            app.ui_event(:test_event, 0, 2, 3)
+        end
+    end
+
     describe "cycle end handlers" do
         it "registers a new handler called when the execution engine announces a cycle end" do
             recorder = flexmock
@@ -379,11 +694,11 @@ describe Roby::Interface::Interface do
             recorder.should_receive(:called).once
             app.plan.execution_engine.cycle_end(Hash.new)
         end
-        it "calls #push_pending_job_notifications before the handler" do
+        it "calls #push_pending_notifications before the handler" do
             recorder = flexmock
             interface.on_cycle_end { recorder.called }
 
-            flexmock(interface).should_receive(:push_pending_job_notifications).once.globally.ordered
+            flexmock(interface).should_receive(:push_pending_notifications).once.globally.ordered
             recorder.should_receive(:called).once.globally.ordered
             app.plan.execution_engine.cycle_end(Hash.new)
         end
@@ -395,5 +710,23 @@ describe Roby::Interface::Interface do
             app.plan.execution_engine.cycle_end(Hash.new)
         end
     end
-end
 
+    describe "#enable_backtrace_filtering" do
+        it "disables backtrace filtering on the app" do
+            interface.enable_backtrace_filtering(enable: false)
+            refute interface.app.filter_backtraces?
+        end
+        it "reenables backtrace filtering on the app" do
+            interface.enable_backtrace_filtering(enable: false)
+            interface.enable_backtrace_filtering(enable: true)
+            assert interface.app.filter_backtraces?
+        end
+    end
+
+    describe "#log_dir" do
+        it "returns the app's log dir" do
+            flexmock(interface.app).should_receive(:log_dir).and_return(result = flexmock)
+            assert_equal result, interface.log_dir
+        end
+    end
+end

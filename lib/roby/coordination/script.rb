@@ -56,7 +56,7 @@ module Roby
                     end
                     event = self.event.resolve
                     event.on do |ev|
-                        if ev.generator == self.event.resolve && !disabled?
+                        if !disabled? && ev.generator == self.event.resolve
                             cancel
                             script.step
                         end
@@ -106,7 +106,10 @@ module Roby
                                 event.resolve.emit
                                 script.jump_to(timeout_stop)
                             else
-                                raise TimedOut.new(script.root_task, script.current_instruction), "#{script.current_instruction} timed out"
+                                e = TimedOut.new(
+                                    script.root_task, script.current_instruction).
+                                    exception("#{script.current_instruction} timed out")
+                                script.root_task.execution_engine.add_error(e)
                             end
                         end
                     end

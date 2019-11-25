@@ -3,7 +3,7 @@ require 'roby/test/self'
 module Roby
     module Relations
         describe Space do
-            let(:klass) do
+            let(:support_class) do
                 Class.new do
                     attr_reader :relation_graphs
                     def initialize(graphs = Hash.new)
@@ -12,10 +12,10 @@ module Roby
                     def plan; Hash.new { |h, k| k } end
                 end
             end
-            let(:space) { Roby.RelationSpace(klass) }
+            let(:space) { Roby.RelationSpace(support_class) }
             let(:graphs) { space.instanciate }
             def create_node(name = nil)
-                obj = klass.new(graphs)
+                obj = support_class.new(graphs)
                 if name
                     obj.singleton_class.class_eval do
                         define_method(:inspect) { name }
@@ -112,7 +112,7 @@ module Roby
                         parent, child = create_node, create_node
                         parent.add_child child
                         parent.remove_child child
-                        assert_equal nil, parent.child
+                        assert_nil parent.child
                     end
 
                     it "resets the accessor to other children if there are some when the child is removed" do
@@ -136,6 +136,66 @@ module Roby
                         parent.add_child other_child
                         parent.relation_graph_for(space::R).remove_vertex(other_child)
                         assert_equal child, parent.child
+                    end
+
+                    describe "within a transaction" do
+                        before do
+                            @plan = Roby::Plan.new
+                            @plan.add(@planned_task = Roby::Task.new)
+                            @plan.add(@planning_task = Roby::Task.new)
+                            @trsc = Roby::Transaction.new(@plan)
+                        end
+
+                        it "has nil accessors if the real task has nil accessors" do
+                            assert_nil @trsc[@planning_task].planned_task
+                            assert_nil @trsc[@planned_task].planning_task
+                        end
+
+                        it "wraps the child on first access" do
+                            @planned_task.planned_by(@planning_task)
+                            assert_equal @planning_task, @trsc[@planned_task].
+                                planning_task.__getobj__
+                        end
+
+                        it "sets the accessors to nil if the relation is removed" do
+                            @planned_task.planned_by(@planning_task)
+                            @trsc[@planned_task].remove_planning_task(
+                                @trsc[@planning_task])
+                            @trsc.commit_transaction
+                            assert_nil @planned_task.planning_task
+                        end
+
+                        it "updates the accessors if updated in the transaction" do
+                            @planned_task.planned_by(@planning_task)
+                            @trsc[@planned_task].remove_planning_task(
+                                @trsc[@planning_task])
+                            @trsc[@planned_task].planned_by(
+                                new_planning_task = Roby::Task.new)
+                            @trsc.commit_transaction
+                            assert_equal new_planning_task, @planned_task.planning_task
+                        end
+
+                        it "updates the parent on commit if updated in the transaction" do
+                            @planned_task.planned_by(@planning_task)
+                            new_planned_task = Roby::Task.new
+                            @trsc[@planned_task].remove_planning_task(
+                                @trsc[@planning_task])
+                            new_planned_task.planned_by(
+                                @trsc[@planning_task])
+                            @trsc.commit_transaction
+                            assert_equal @planning_task, new_planned_task.planning_task
+                        end
+
+                        it "handles relations modified between transactions" do
+                            @planned_task.planned_by(@planning_task)
+                            @plan.add(new_planned_task = Roby::Task.new)
+                            @trsc[@planned_task].remove_planning_task(
+                                @trsc[@planning_task])
+                            @trsc[new_planned_task].planned_by(
+                                @trsc[@planning_task])
+                            @trsc.commit_transaction
+                            assert_equal @planning_task, new_planned_task.planning_task
+                        end
                     end
                 end
 
@@ -165,11 +225,11 @@ module Roby
                         it "is passed the child only" do
                             subject.add_child(child = create_node)
                             recorder.should_receive(:called).with([child]).once
-                            assert_equal nil, subject.find_child { |*c| recorder.called(c) }
+                            assert_nil subject.find_child { |*c| recorder.called(c) }
                         end
 
                         it "returns nil if there are no matching children" do
-                            assert_equal nil, subject.find_child { |c| false }
+                            assert_nil subject.find_child { |c| false }
                         end
 
                         it "returns the first child for which the block returns true" do
@@ -197,23 +257,23 @@ module Roby
 
                     describe "#find_CHILD" do
                         it "returns nil if there are no children" do
-                            assert_equal nil, subject.find_child
+                            assert_nil subject.find_child
                         end
 
                         it "yields the child only if its argument is false" do
                             subject.add_child(child = create_node, info = flexmock)
                             recorder.should_receive(:called).with([child]).once
-                            assert_equal nil, subject.find_child(false) { |*c| recorder.called(c) }
+                            assert_nil subject.find_child(false) { |*c| recorder.called(c) }
                         end
 
                         it "yields the child and info" do
                             subject.add_child(child = create_node, info = flexmock)
                             recorder.should_receive(:called).with([child, info]).once
-                            assert_equal nil, subject.find_child { |*c| recorder.called(c) }
+                            assert_nil subject.find_child { |*c| recorder.called(c) }
                         end
 
                         it "returns nil if there are no matching children" do
-                            assert_equal nil, subject.find_child { |c| false }
+                            assert_nil subject.find_child { |c| false }
                         end
 
                         it "returns the first child for which the block returns true" do

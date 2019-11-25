@@ -33,12 +33,12 @@ module Roby
         #    started if and only if it has at least one parent that is running
         #    (i.e. children are started after their parents).
         #
-	class Basic < Reporting
+        class Basic < Reporting
             # The plan on which the scheduler applies
             attr_reader :plan
             # The Roby::Query which is used to get the set of tasks that might
             # be startable
-	    attr_reader :query
+            attr_reader :query
             # If true, the scheduler will start tasks which are non-root in the
             # dependency relation, if they have parents that are already
             # running. 
@@ -50,19 +50,19 @@ module Roby
             # See Basic for a description of the +include_children+ option.
             #
             # If +plan+ is set to nil, the scheduler will use Roby.plan
-	    def initialize(include_children = false, plan = nil)
+            def initialize(include_children = false, plan = nil)
                 super()
 
                 @plan = plan || Roby.plan
                 @include_children = include_children
-		@query = self.plan.find_tasks.
-		    executable.
-		    pending.
-		    self_owned
+                @query = self.plan.find_tasks.
+                    executable.
+                    pending.
+                    self_owned
 
                 @can_schedule_cache = Hash.new
                 @enabled = true
-	    end
+            end
 
             attr_predicate :enabled?, true
 
@@ -111,15 +111,18 @@ module Roby
                     true
                 elsif include_children && task.parents.any? { |t| t.running? }
                     true
-                else
+                elsif include_children
                     report_holdoff "not root, and has no running parent", task
+                    false
+                else
+                    report_holdoff "not root, and include_children is false", task
                     false
                 end
             end
 
             # Starts all tasks that are eligible. See the documentation of the
             # Basic class for an in-depth description
-	    def initial_events
+            def initial_events
                 @can_schedule_cache.clear
                 time = Time.now
 
@@ -140,7 +143,7 @@ module Roby
                 end
 
                 scheduled_tasks = []
-		for task in query.reset
+                for task in query.reset
                     result =
                         if @can_schedule_cache.include?(task)
                             @can_schedule_cache[task]
@@ -152,10 +155,10 @@ module Roby
                         report_trigger task.start_event
                         scheduled_tasks << task
                     end
-		end
+                end
                 scheduled_tasks
-	    end
-	end
+            end
+        end
     end
 end
 

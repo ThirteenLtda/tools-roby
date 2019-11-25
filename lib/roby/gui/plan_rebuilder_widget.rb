@@ -127,6 +127,10 @@ module Roby
                 snapshot = Snapshot.new plan_rebuilder.stats.dup,
                     DRoby::RebuiltPlan.new
                 snapshot.plan.merge(plan_rebuilder.plan)
+                if @last_snapshot
+                    snapshot.plan.dedupe(@last_snapshot.plan)
+                end
+                @last_snapshot = snapshot
 
                 cycle = snapshot.stats[:cycle_index]
                 time = Time.at(*snapshot.stats[:start]) + snapshot.stats[:actual_start]
@@ -147,10 +151,10 @@ module Roby
             end
 
             def apply(snapshot)
-                @current_time = Time.at(*snapshot.stats[:start]) + snapshot.stats[:end]
+                @display_time = Time.at(*snapshot.stats[:start]) + snapshot.stats[:end]
                 @current_plan.clear
                 @current_plan.merge(snapshot.plan)
-                emit appliedSnapshot(Qt::DateTime.new(@current_time))
+                emit appliedSnapshot(Qt::DateTime.new(@display_time))
             end
 
             def seek(time)
@@ -194,8 +198,8 @@ module Roby
             end
 
             # Opens +filename+ and reads the data from there
-            def open(filename)
-                @logfile = DRoby::Logfile::Reader.open(filename)
+            def open(filename, index_path: nil)
+                @logfile = DRoby::Logfile::Reader.open(filename, index_path: index_path)
                 self.window_title = "roby-display: #{filename}"
                 emit sourceChanged
                 analyze
@@ -210,6 +214,7 @@ module Roby
                 start_time, end_time = logfile.index.range
 
                 start = Time.now
+                puts "log file is #{(end_time - start_time).ceil}s long"
                 dialog = Qt::ProgressDialog.new("Analyzing log file", "Quit", 0, (end_time - start_time))
                 dialog.setWindowModality(Qt::WindowModal)
                 dialog.show
@@ -221,7 +226,7 @@ module Roby
                         needs_snapshot =
                             (plan_rebuilder.has_structure_updates? ||
                              plan_rebuilder.has_event_propagation_updates?)
-                        yield(needs_snapshot, data) 
+                        yield(needs_snapshot, data)
                     end
                     plan_rebuilder.clear_integrated
                     dialog.setValue(plan_rebuilder.cycle_start_time - start_time)
@@ -300,7 +305,7 @@ module Roby
 
                     cycle = plan_rebuilder.cycle_index
                     time = plan_rebuilder.cycle_start_time
-                    emit info("@#{cycle} - #{time.strftime('%H:%M:%S')}.#{'%.03i' % [time.tv_usec / 1000]}")
+                    emit info("@#{cycle} - #{time.strftime('%H:%M:%S.%3N')}")
                 end
                 @connection_pull = timer = Qt::Timer.new(self)
                 timer.connect(SIGNAL('timeout()')) do
@@ -331,12 +336,19 @@ module Roby
                 plan_rebuilder.cycle_start_time
             end
 
+            # The start time of the first received cycle
+            def start_time
+                plan_rebuilder.start_time
+            end
+
+            # The end time of the last received cycle
             def current_time
                 plan_rebuilder.current_time
             end
 
-            def start_time
-                plan_rebuilder.start_time
+            # The time of the currently selected snapshot
+            def display_time
+                @display_time || start_time
             end
         end
     end

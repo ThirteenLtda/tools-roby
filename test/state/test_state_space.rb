@@ -14,7 +14,7 @@ class TC_StateSpace < Minitest::Test
                 leaf.send(f)
             end
             parent.attach
-            parent.__set(leaf_name, StateVariableModel.new(parent, leaf_name))
+            parent.set(leaf_name, StateVariableModel.new(parent, leaf_name))
         end
         StateSpace.new(model)
     end
@@ -22,7 +22,7 @@ class TC_StateSpace < Minitest::Test
     def test_state_space_creates_structure
         m = StateModel.new
         pose = m.send('pose')
-        pose.__set(:position, StateVariableModel.new(nil, nil))
+        pose.set(:position, StateVariableModel.new(nil, nil))
         m.val = Class.new
 
         s = StateSpace.new(m)
@@ -58,7 +58,7 @@ class TC_StateSpace < Minitest::Test
         position_field = m.pose.position
         empty_field = m.empty_field
 
-        flexmock(m).should_receive(:__set).never
+        flexmock(m).should_receive(:set).never
         flexmock(m).should_receive(:attach_child).and_raise(ArgumentError)
 
         s = StateSpace.new(m)
@@ -112,51 +112,51 @@ class TC_StateSpace < Minitest::Test
     end
 
     def test_export
-	s = create_state_space('pos.x', 'speed.x')
-	s.pos.x   = 42
-	s.speed.x = 0
+        s = create_state_space('pos.x', 'speed.x')
+        s.pos.x   = 42
+        s.speed.x = 0
 
-	obj = Marshal.load(Marshal.dump(s))
-	assert(obj.respond_to?(:pos))
-	assert(obj.respond_to?(:speed))
-	assert_equal(42, obj.pos.x)
-	assert_equal(0, obj.speed.x)
+        obj = Marshal.load(Marshal.dump(s))
+        assert(obj.respond_to?(:pos))
+        assert(obj.respond_to?(:speed))
+        assert_equal(42, obj.pos.x)
+        assert_equal(0, obj.speed.x)
 
-	s.export :pos
-	obj = Marshal.load(Marshal.dump(s))
-	assert(obj.respond_to?(:pos))
-	assert(!obj.respond_to?(:speed))
-	assert_equal(42, obj.pos.x)
+        s.export :pos
+        obj = Marshal.load(Marshal.dump(s))
+        assert(obj.respond_to?(:pos))
+        assert(!obj.respond_to?(:speed))
+        assert_equal(42, obj.pos.x)
 
-	s.export :speed
-	obj = Marshal.load(Marshal.dump(s))
-	assert(obj.respond_to?(:pos))
-	assert(obj.respond_to?(:speed))
-	assert_equal(42, obj.pos.x)
-	assert_equal(0, obj.speed.x)
+        s.export :speed
+        obj = Marshal.load(Marshal.dump(s))
+        assert(obj.respond_to?(:pos))
+        assert(obj.respond_to?(:speed))
+        assert_equal(42, obj.pos.x)
+        assert_equal(0, obj.speed.x)
 
         s.export_none
-	obj = Marshal.load(Marshal.dump(s))
-	assert(!obj.respond_to?(:pos))
-	assert(!obj.respond_to?(:speed))
+        obj = Marshal.load(Marshal.dump(s))
+        assert(!obj.respond_to?(:pos))
+        assert(!obj.respond_to?(:speed))
 
         s.export_all
-	obj = Marshal.load(Marshal.dump(s))
-	assert(obj.respond_to?(:pos))
-	assert(obj.respond_to?(:speed))
-	assert_equal(42, obj.pos.x)
-	assert_equal(0, obj.speed.x)
+        obj = Marshal.load(Marshal.dump(s))
+        assert(obj.respond_to?(:pos))
+        assert(obj.respond_to?(:speed))
+        assert_equal(42, obj.pos.x)
+        assert_equal(0, obj.speed.x)
     end
 
     def test_last_known_is_accessible_from_the_field
         source = Object.new
 
         s = create_state_space('pose.position')
-        s.last_known.pose.__set(:position, source)
+        s.last_known.pose.set(:position, source)
         assert_same s.pose.last_known.position, s.last_known.pose.position
 
         s = create_state_space('pose.position')
-        s.pose.last_known.__set(:position, source)
+        s.pose.last_known.set(:position, source)
         assert_same s.pose.last_known.position, s.last_known.pose.position
     end
 

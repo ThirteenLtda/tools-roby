@@ -27,13 +27,27 @@ module Roby
                 end
             end
 
+            class TemplateEventGenerator < EventGenerator
+                def initialize(controlable, event_model, plan: Template.new)
+                    super(controlable, plan: plan)
+                    @event_model = event_model
+                end
+                def model
+                    @event_model
+                end
+            end
+
+            def invalidate_template
+                @template = nil
+            end
+
             # The plan that is used to instantiate this task model
             def template
                 return @template if @template
 
                 template = Template.new
                 each_event do |event_name, event_model|
-                    template.add(event = EventGenerator.new(event_model.controlable?, plan: template))
+                    template.add(event = TemplateEventGenerator.new(event_model.controlable?, event_model, plan: template))
                     template.events_by_name[event_name] = event
                 end
 
@@ -132,7 +146,7 @@ module Roby
 
             def compute_terminal_events(events)
                 success_events, failure_events, terminal_events =
-                    [events[:success]].to_set, 
+                    [events[:success]].to_set,
                     [events[:failed]].to_set,
                     [events[:stop], events[:success], events[:failed]].to_set
 
@@ -140,6 +154,15 @@ module Roby
                 discover_terminal_events(event_set, terminal_events, success_events, events[:success])
                 discover_terminal_events(event_set, terminal_events, failure_events, events[:failed])
                 discover_terminal_events(event_set, terminal_events, nil, events[:stop])
+
+                events.each_value do |ev|
+                    if ev.event_model.terminal?
+                        if !success_events.include?(ev) && !failure_events.include?(ev)
+                            terminal_events << ev
+                        end
+                    end
+                end
+
                 return terminal_events, success_events, failure_events
             end
 
@@ -188,7 +211,6 @@ module Roby
                 if abstract?
                     raise Application::ActionResolutionError, "#{self} is abstract and no planning method exists that returns it"
                 else
-                    Robot.warn "no planning method for #{self}, and #{self} is not abstract. Returning new instance"
                     new(arguments)
                 end
             end
@@ -210,7 +232,7 @@ module Roby
                     end
 
                     [@events, @signal_sets, @forwarding_sets, @causal_link_sets,
-                        @argument_set, @handler_sets, @precondition_sets].each do |set|
+                        @arguments, @handler_sets, @precondition_sets].each do |set|
                         set.clear if set
                     end
                 end
@@ -227,7 +249,7 @@ module Roby
             #   .each_signal(model)
             #   .signals(model)
             #   #each_signal(model)
-            #   
+            #
             def self.model_attribute_list(name) # :nodoc:
                 class_eval <<-EOD, __FILE__, __LINE__+1
                     inherited_attribute("#{name}_set", "#{name}_sets", map: true) { Hash.new { |h, k| h[k] = Set.new } }
@@ -263,7 +285,7 @@ module Roby
             def self.model_relation(name)
                 model_attribute_list(name)
             end
-                
+
 
             # @!group Event Relations
 
@@ -288,7 +310,7 @@ module Roby
             #
             # Signals cause the target event(s) command to be called when the
             # source event is emitted.
-            # 
+            #
             # @param [Hash<Symbol,Array<Symbol>>,Hash<Symbol,Symbol>] mappings the source-to-target mappings
             # @raise [ArgumentError] if the target event is not controlable,
             #   i.e. not have a command
@@ -323,7 +345,7 @@ module Roby
             # Causal links are used during event propagation to order the
             # propagation properly. Establish a causal link when e.g. an event
             # handler might call or emit on another of this task's event
-            # 
+            #
             # @param [Hash<Symbol,Array<Symbol>>,Hash<Symbol,Symbol>] mappings the source-to-target mappings
             #
             # @example when establishing multiple relations from the same source use name-to-arrays
@@ -400,28 +422,28 @@ module Roby
             #     terminates
             #   end
             #
-	    def terminates
-		event :failed, command: true, terminal: true
-		interruptible
-	    end
+            def terminates
+                event :failed, command: true, terminal: true
+                interruptible
+            end
 
             # Declare that tasks of this model can be interrupted by calling the
             # command of {Roby::Task#failed_event}
             #
             # @raise [ArgumentError] if {Roby::Task#failed_event} is not controlable.
-	    def interruptible
-		if !has_event?(:failed) || !event_model(:failed).controlable?
-		    raise ArgumentError, "failed is not controlable"
-		end
+            def interruptible
+                if !has_event?(:failed) || !event_model(:failed).controlable?
+                    raise ArgumentError, "failed is not controlable"
+                end
 
-		event(:stop) do |context| 
-		    if starting?
+                event(:stop) do |context|
+                    if starting?
                         start_event.signals stop_event
-			return
-		    end
-		    failed!(context)
-		end
-	    end
+                        return
+                    end
+                    failed!(context)
+                end
+            end
 
             # True if this task is an abstract task
             #
@@ -469,14 +491,14 @@ module Roby
                     else
                         ev = superclass.event_model(sym)
                         unless ev.terminal?
-                            event sym, model: ev, terminal: true, 
+                            event sym, model: ev, terminal: true,
                                 command: (ev.method(:call) rescue nil)
                         end
                     end
                 end
             end
 
-            # Defines a new event on this task. 
+            # Defines a new event on this task.
             #
             # @param [Symbol] event_name the event name
             # @param [Hash] options an option hash
@@ -541,16 +563,11 @@ module Roby
             #
             # @param [Symbol] event_name the event name
             def define_command_method(event_name, block)
-                check_arity(block, 1)
+                check_arity(block, 1, strict: true)
                 define_method("event_command_#{event_name}", &block)
                 method = instance_method("event_command_#{event_name}")
-                lambda do |dst_task, *event_context| 
-                    begin
-                        dst_task.calling_event = dst_task.event(event_name)
-                        method.bind(dst_task).call(*event_context) 
-                    ensure
-                        dst_task.calling_event = nil
-                    end
+                lambda do |dst_task, *event_context|
+                    method.bind(dst_task).call(*event_context)
                 end
             end
 
@@ -560,19 +577,20 @@ module Roby
             #
             # @param [Symbol] event_name the event name
             def define_event_methods(event_name)
+                event_name = event_name.to_sym
                 if !method_defined?("#{event_name}_event")
                     define_method("#{event_name}_event") do
-                        event(event_name)
+                        @bound_events[event_name] || event(event_name)
                     end
                 end
                 if !method_defined?("#{event_name}?")
                     define_method("#{event_name}?") do
-                        event(event_name).emitted?
+                        (@bound_events[event_name] || event(event_name)).emitted?
                     end
                 end
                 if !method_defined?("#{event_name}!")
-                    define_method("#{event_name}!") do |*context| 
-                        event(event_name).call(*context)
+                    define_method("#{event_name}!") do |*context|
+                        (@bound_events[event_name] || event(event_name)).call(*context)
                     end
                 end
                 if !respond_to?("#{event_name}_event")
@@ -604,7 +622,7 @@ module Roby
 
                 # Check for inheritance rules
                 if events.include?(event_name)
-                    raise ArgumentError, "event #{event_name} already defined" 
+                    raise ArgumentError, "event #{event_name} already defined"
                 elsif old_event = find_event_model(event_name)
                     if old_event.terminal? && !options[:terminal]
                         raise ArgumentError, "trying to override #{old_event.symbol} in #{self} which is terminal into a non-terminal event"
@@ -660,18 +678,18 @@ module Roby
                     elsif ev_model != model_def
                         raise ArgumentError, "the event model #{model_def} is not a model for #{name} (found #{ev_model} with the same name)"
                     end
-                else 
+                else
                     raise ArgumentError, "wanted either a symbol or an event class, got #{model_def}"
                 end
 
                 ev_model
             end
-           
+
             # Checks if _name_ is a name for an event of this task
             alias :has_event? :find_event_model
 
             private :validate_event_definition_request
-        
+
             # Adds an event handler for the given event model. The block is
             # going to be called whenever some events are emitted.
             #
@@ -687,10 +705,10 @@ module Roby
                     raise ArgumentError, "#on called without a block"
                 end
 
-                check_arity(user_handler, 1)
+                check_arity(user_handler, 1, strict: true)
                 event_names.each do |from|
                     from = event_model(from).symbol
-                    if user_handler 
+                    if user_handler
                         method_name = "event_handler_#{from}_#{Object.address_from_id(user_handler.object_id).to_s(16)}"
                         define_method(method_name, &user_handler)
 
@@ -749,13 +767,13 @@ module Roby
             #
             # @example install a handler for a TaskModelViolation exception
             #   on_exception(TaskModelViolation, ...) do |task, exception_object|
-            #	    if cannot_handle
-            #	        task.pass_exception # send to the next handler
-            #	    end
+            #       if cannot_handle
+            #           task.pass_exception # send to the next handler
+            #       end
             #       do_handle
             #   end
             def on_exception(matcher, &handler)
-                check_arity(handler, 1)
+                check_arity(handler, 1, strict: true)
                 matcher = matcher.to_execution_exception_matcher
                 id = (@@exception_handler_id += 1)
                 define_method("exception_handler_#{id}", &handler)
@@ -796,18 +814,10 @@ module Roby
                     models = models.to_a
                 else models = [models]
                 end
-                models = models.inject([]) do |models, m|
-                    if m.respond_to?(:each_fullfilled_model)
-                        models.concat(m.each_fullfilled_model.to_a)
-                    else
-                        models << m
-                    end
-                end
 
-                # Check the arguments that are required by the model
-                for tag in models
-                    if !has_ancestor?(tag)
-                        return false
+                models.each do |m|
+                    m.each_fullfilled_model do |test_m|
+                        return false if !has_ancestor?(test_m)
                     end
                 end
                 return true

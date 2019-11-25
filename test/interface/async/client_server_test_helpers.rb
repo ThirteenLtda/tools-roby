@@ -17,12 +17,17 @@ module Roby
                     @interface_servers.each(&:close)
                 end
 
+                def app
+                    Roby.app
+                end
+
                 def default_server_port
                     Roby::Interface::DEFAULT_PORT + 1
                 end
 
                 def create_server
-                    server = Roby::Interface::TCPServer.new(Roby.app, default_server_port)
+                    server = Roby::Interface::TCPServer.new(
+                        Roby.app, port: default_server_port)
                     @interface_servers << server
                     server
                 end
@@ -35,20 +40,30 @@ module Roby
 
                 def connect(server = nil, **options, &block)
                     server ||= create_server
-                    client = create_client('localhost', port: server.port, **options)
+                    client = create_client('localhost', port: server.ip_port, **options)
                     yield(client) if block_given?
                     client
                 ensure
                     while !client.connection_future.complete?
-                        sleep 0.1
+                        sleep 0.01
                         server.process_pending_requests
                     end
                     client.poll
                 end
 
                 def process_call(&block)
-                    futures = [Concurrent::Future.new(&block),
-                               Concurrent::Future.new { @interfaces.each(&:poll) }]
+                    poll_async_interfaces = Concurrent::Future.new do
+                        @interfaces.each do |async_interface|
+                            if async_interface.client
+                                async_interface.client.io.reset_thread_guard
+                            end
+                            async_interface.poll
+                            if async_interface.client
+                                async_interface.client.io.reset_thread_guard
+                            end
+                        end
+                    end
+                    futures = [Concurrent::Future.new(&block), poll_async_interfaces]
                     result = futures.map do |future|
                         future.execute
                         while !future.complete?

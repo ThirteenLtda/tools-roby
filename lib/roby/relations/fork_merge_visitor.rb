@@ -77,6 +77,7 @@ module Roby
             def compute_in_out_degrees(origin, origin_neighbours)
                 visitor = SubgraphDegreeCounter.new(graph)
                 origin_neighbours.each do |v|
+                    next if visitor.color_map[v] != :WHITE
                     graph.depth_first_visit(v, visitor) { }
                 end
                 in_degree, out_degree = visitor.in_degree, visitor.out_degree
@@ -91,21 +92,28 @@ module Roby
 
             def follow_edge?(u, v)
                 if u == origin
-                    origin_neighbours.include?(v)
+                    return if !origin_neighbours.include?(v)
+                end
+
+                degree = in_degree[v]
+                if degree == 1
+                    true
                 else
-                    degree = in_degree[v]
-                    if degree == 1
-                        true
-                    else
-                        pending_merges[v].size == degree
-                    end
+                    (pending_merges[v].size + 1) == degree
                 end
             end
 
-            def handle_examine_edge(u, v)
+            def handle_forward_edge(u, v)
+                if u == origin
+                    return if !origin_neighbours.include?(v)
+                end
+
                 obj = vertex_to_object.fetch(u)
-                if out_degree[u] > 1
-                    obj = obj.fork
+                if obj
+                    if out_degree[u] > 1
+                        obj = fork_object(obj)
+                    end
+                    obj = propagate_object(u, v, obj)
                 end
                 if in_degree[v] > 1
                     pending_merges[v] << obj
@@ -115,12 +123,30 @@ module Roby
             end
 
             def handle_tree_edge(u, v)
-                if in_degree[v] > 1
-                    obj = pending_merges.delete(v).inject { |a, b| a.merge(b) }
-                    vertex_to_object[v] = obj
-                else
-                    obj = vertex_to_object.fetch(v)
+                obj = vertex_to_object.fetch(u)
+                if obj
+                    if out_degree[u] > 1
+                        obj = fork_object(obj)
+                    end
+                    obj = propagate_object(u, v, obj)
                 end
+
+                if in_degree[v] > 1
+                    obj = (pending_merges.delete(v) << obj).compact.inject { |a, b| a.merge(b) }
+                end
+                vertex_to_object[v] = obj
+            end
+
+            def handle_back_edge(u, v)
+                raise "#handle_back_edge should never happen in a fork-merge traversal"
+            end
+
+            def propagate_object(u, v, obj)
+                obj
+            end
+
+            def fork_object(obj)
+                obj.fork
             end
         end
     end

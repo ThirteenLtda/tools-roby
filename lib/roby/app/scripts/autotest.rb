@@ -14,6 +14,8 @@ app.simulation = true
 app.testing = true
 app.auto_load_models = false
 
+MetaRuby.keep_definition_location = false
+
 modes = []
 robots = []
 cmdline_args = []
@@ -33,7 +35,7 @@ parser = OptionParser.new do |opt|
         modes << '--sim'
     end
     opt.on("-l", "--live", "run tests in live mode") do |val|
-	modes << '--live'
+        modes << '--live'
     end
     opt.on '--all-robots', 'run tests for all robots' do
         all_robots = true
@@ -42,12 +44,13 @@ parser = OptionParser.new do |opt|
         robots << name
     end
     opt.on("-k", "--keep-logs", "keep all logs") do |val|
-	cmdline_args << '--keep-logs'
+        cmdline_args << '--keep-logs'
     end
     opt.on('--server=PID', Integer, 'the minitest server PID (used to generate a drbunix path)') do |pid|
         server_pid = pid
         cmdline_args << "--server" << pid.to_s
     end
+    Roby::Application.common_optparse_setup(opt)
 end
 
 test_files = parser.parse(ARGV)
@@ -158,6 +161,7 @@ Roby.display_exception do
             end
         ensure
             reporter.test_finished
+            Roby.app.shutdown
             Roby.app.cleanup
             if reporter.has_failures?
                 manager.exit_code 1

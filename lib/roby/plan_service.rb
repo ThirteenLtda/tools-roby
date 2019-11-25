@@ -6,6 +6,8 @@ module Roby
     #
     # It forwards method calls to the underlying task
     class PlanService
+        extend Transaction::Proxying::Cache
+
         # The underlying task
         #
         # @return [Roby::Task]
@@ -69,16 +71,18 @@ module Roby
         # status changes
         #
         # @yieldparam [Symbol] status one of :mission, :permanent or :normal
-        def on_plan_status_change(&block)
+        def on_plan_status_change(initial: true, &block)
             plan_status_handlers << block
-            current_status =
-                if task.plan.mission_task?(task)
-                    :mission
-                elsif task.plan.permanent_task?(task)
-                    :permanent
-                else :normal
-                end
-            block.call(current_status)
+            if initial
+                current_status =
+                    if task.plan.mission_task?(task)
+                        :mission
+                    elsif task.plan.permanent_task?(task)
+                        :permanent
+                    else :normal
+                    end
+                block.call(current_status)
+            end
         end
 
         # Called to notify about a plan status change for the underlying task
@@ -169,13 +173,13 @@ module Roby
             end
         end
 
-        def respond_to?(name, *args)
-            super || task.respond_to?(name, *args)
+        def respond_to_missing?(m, include_private)
+            task.respond_to?(m)
         end
 
         # Forwards all calls to {task}
         def method_missing(*args, &block) # :nodoc:
-            task.send(*args, &block)
+            task.public_send(*args, &block)
         end
 
         # Returns the underlying task

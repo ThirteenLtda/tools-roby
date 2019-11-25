@@ -1,12 +1,40 @@
 require "bundler/gem_tasks"
 require "rake/testtask"
+require 'yard'
+require 'yard/rake/yardoc_task'
 
 task :default
+
+if ENV['TEST_DISABLE_GUI'] == '1'
+    has_gui = false
+else
+    has_gui = begin
+                  require 'Qt'
+                  true
+              rescue LoadError
+                  false
+              end
+end
 
 Rake::TestTask.new(:test) do |t|
     t.libs << "."
     t.libs << "lib"
-    t.test_files = FileList['test/suite_core.rb']
+    test_files = FileList['test/**/test_*.rb']
+    if RUBY_ENGINE != 'ruby'
+        test_files = test_files.exclude("test/app/test_debug.rb")
+    end
+    if ENV['TEST_FAST'] == '1'
+        test_files = test_files.
+            exclude('test/cli/**/*.rb').
+            exclude('test/app/cucumber/test_controller.rb').
+            exclude('test/app/test_run.rb').
+            exclude('test/interface/async/test_interface.rb')
+    end
+    if !has_gui
+        test_files = test_files.exclude("test/test_gui.rb")
+    end
+    t.test_files = test_files
+    t.warning = false
 end
 
 begin
@@ -36,3 +64,5 @@ task :uic do
 end
 task :compile => :uic
 
+YARD::Rake::YardocTask.new
+task :doc => :yard

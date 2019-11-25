@@ -1,12 +1,17 @@
 module Roby
     # A plan that can be used for execution
+    #
+    # While {Plan} maintains the plan data structure itself, this class provides
+    # excution-related services such as exceptions and GC-related methods
     class ExecutablePlan < Plan
-	extend Logger::Hierarchy
-	extend Logger::Forward
+        extend Logger::Hierarchy
+        extend Logger::Forward
 
         # The ExecutionEngine object which handles this plan. The role of this
         # object is to provide the event propagation, error propagation and
         # garbage collection mechanisms for the execution.
+        #
+        # @return [ExecutionEngine]
         attr_accessor :execution_engine
 
         # The ConnectionSpace object which handles this plan. The role of this
@@ -24,59 +29,50 @@ module Roby
         # propagation.
         def control; execution_engine.control end
 
-	# A set of tasks which are useful (and as such would not been garbage
-	# collected), but we want to GC anyway
-	attr_reader :force_gc
-
-	# A set of task for which GC should not be attempted, either because
-	# they are not interruptible or because their start or stop command
-	# failed
-	attr_reader :gc_quarantine
-
-        # Put the given task in quarantine. In practice, it means that all the
-        # event relations of that task's events are removed, as well as its
-        # children. Then, the task is added to gc_quarantine (the task will not
-        # be GCed anymore).
+        # A set of tasks which are useful (and as such would not been garbage
+        # collected), but we want to GC anyway
         #
-        # This is used as a last resort, when the task cannot be stopped/GCed by
-        # normal means.
-        def quarantine(task)
-            task.each_event do |ev|
-                ev.clear_relations
-            end
-            for rel in task.sorted_relations
-                next if rel == Roby::TaskStructure::ExecutionAgent
-                for child in task.child_objects(rel).to_a
-                    task.remove_child_object(child, rel)
-                end
-            end
-            Roby::ExecutionEngine.warn "putting #{task} in quarantine"
-            gc_quarantine << task
-            self
-        end
+        # @return [Set<Roby::Task>]
+        attr_reader :force_gc
 
-        # Tests whether a task is in the quarantine
+        # The list of plan-wide exception handlers
         #
-        # @see #quarantine
-        def quarantined_task?(task)
-            gc_quarantine.include?(task)
-        end
-
-	# Check that this is an executable plan. This is always true for
-	# plain Plan objects and false for transcations
-	def executable?; true end
+        # @return [Array<(#===, #call)>]
+        attr_reader :exception_handlers
 
         def initialize(event_logger: DRoby::NullEventLogger.new)
             super(graph_observer: self, event_logger: event_logger)
 
             @execution_engine = ExecutionEngine.new(self)
-	    @force_gc    = Set.new
-	    @gc_quarantine = Set.new
+            @force_gc    = Set.new
             @exception_handlers = Array.new
             on_exception LocalizedError do |plan, error|
                 plan.default_localized_error_handling(error)
             end
         end
+
+        # @api private
+        #
+        # Put the given task in quarantine. In practice, it means that all the
+        # event relations of that task's events are removed, as well as its
+        # children. Then, the task is marked as quarantined with
+        # {Task#quarantined?} and the engine will not attempt to garbage-collect
+        # it anymore
+        #
+        # This is used as a last resort, when the task cannot be stopped/GCed by
+        # normal means.
+        def quarantine_task(task)
+            log(:quarantined_task, droby_id, task)
+
+            task.quarantined!
+            task.clear_relations(remove_internal: false, remove_strong: false)
+            self
+        end
+
+        # Check that this is an executable plan
+        #
+        # This always returns true for {ExecutablePlan}
+        def executable?; true end
 
         def refresh_relations
             super
@@ -88,6 +84,12 @@ module Roby
             log :register_executable_plan, droby_id
         end
 
+        # @api private
+        #
+        # Default toplevel error handling for {LocalizedError}
+        #
+        # It activates fault handlers, and adds {MissionFailedError} /
+        # {PermanentTaskError}
         def default_localized_error_handling(error)
             matching_handlers = Array.new
             active_fault_response_tables.each do |table|
@@ -110,19 +112,26 @@ module Roby
                 end
             end
 
-            error.each_involved_task.
-                find_all { |t| mission_task?(t) && t != error.origin }.
-                each do |m|
-                    add_error(MissionFailedError.new(m, error.exception))
-                end
-
-            error.each_involved_task.
-                find_all { |t| permanent_task?(t) && t != error.origin }.
-                each do |m|
-                    add_error(PermanentTaskError.new(m, error.exception))
-                end
-
             pass_exception
+        end
+
+        def generate_induced_errors(error_phase_results)
+            error_phase_results.each_fatal_error do |execution_exception, tasks|
+                # MissionFailedError and PermanentTaskError are not propagated,
+                # so tasks == [origin] and we should not re-add an error
+                if execution_exception.exception.kind_of?(MissionFailedError) ||
+                        execution_exception.exception.kind_of?(PermanentTaskError)
+                    next
+                end
+
+                tasks.each do |t|
+                    if mission_task?(t)
+                        add_error(MissionFailedError.new(t, execution_exception.exception), propagate_through: [])
+                    elsif permanent_task?(t)
+                        add_error(PermanentTaskError.new(t, execution_exception.exception), propagate_through: [])
+                    end
+                end
+            end
         end
 
         # Calls the given block in the execution thread of this plan's engine.
@@ -133,11 +142,24 @@ module Roby
             execution_engine.execute(&block)
         end
 
+        # @api private
+        #
+        # Hook called when a task is finalized
+        def finalized_task(task)
+            execution_engine.finalized_task(task)
+            super
+        end
+
+        # @api private
+        #
+        # Hook called when an event is finalized
         def finalized_event(event)
             execution_engine.finalized_event(event)
             super
         end
 
+        # @api private
+        #
         # Hook called before an edge gets added to this plan
         #
         # If an exception is raised, the edge will not be added
@@ -149,9 +171,13 @@ module Roby
         # @param [Object] info the associated edge info that applies to
         #   relations.first
         def adding_edge(parent, child, relations, info)
-            unless parent.read_write? || child.child.read_write?
-		raise OwnershipError, "cannot remove a relation between two objects we don't own"
-	    end
+            if !parent.read_write? || !child.read_write?
+                raise OwnershipError, "cannot remove a relation between two objects we don't own"
+            elsif parent.garbage?
+                raise ReusingGarbage, "attempting to reuse #{parent} which is marked as garbage"
+            elsif child.garbage?
+                raise ReusingGarbage, "attempting to reuse #{child} which is marked as garbage"
+            end
 
             if last_dag = relations.find_all(&:dag?).last
                 if child.relation_graph_for(last_dag).reachable?(child, parent)
@@ -160,20 +186,22 @@ module Roby
             end
 
             relations.each do |rel|
-                if name = rel.child_name
-                    parent.send("adding_#{rel.child_name}", child, info)
-                    child.send("adding_#{rel.child_name}_parent", parent, info)
+                if (name = rel.child_name)
+                    parent.send("adding_#{name}", child, info)
+                    child.send("adding_#{name}_parent", parent, info)
                 end
             end
 
             for trsc in transactions
                 next unless trsc.proxying?
                 if (parent_proxy = trsc[parent, create: false]) && (child_proxy = trsc[child, create: false])
-                    trsc.adding_plan_relation(parent_proxy, child_proxy, relations, info) 
+                    trsc.adding_plan_relation(parent_proxy, child_proxy, relations, info)
                 end
             end
         end
 
+        # @api private
+        #
         # Hook called after a new edge has been added in this plan
         #
         # @param [Object] parent the child object
@@ -188,19 +216,30 @@ module Roby
                     execution_engine.event_ordering.clear
                 end
 
-                if name = rel.child_name
-                    parent.send("added_#{rel.child_name}", child, info)
-                    child.send("added_#{rel.child_name}_parent", parent, info)
+                if (name = rel.child_name)
+                    parent.send("added_#{name}", child, info)
+                    child.send("added_#{name}_parent", parent, info)
                 end
             end
 
             log(:added_edge, parent, child, relations, info)
         end
 
+        # @api private
+        #
+        # Hook called to announce that the edge information of an existing edge
+        # will be updated
+        #
+        # @param parent the edge parent object
+        # @param child the edge child object
+        # @param [Class<Relations::Graph>] relation the relation graph ID
+        # @param [Object] info the new edge info
         def updating_edge_info(parent, child, relation, info)
             emit_relation_change_hook(parent, child, relation, info, prefix: 'updating')
         end
 
+        # @api private
+        #
         # Hook called when the edge information of an existing edge has been
         # updated
         #
@@ -213,6 +252,8 @@ module Roby
             log(:updated_edge_info, parent, child, relation, info)
         end
 
+        # @api private
+        #
         # Hook called before an edge gets removed from this plan
         #
         # If an exception is raised, the edge will not be removed
@@ -223,24 +264,26 @@ module Roby
         #   is being removed
         def removing_edge(parent, child, relations)
             unless parent.read_write? || child.child.read_write?
-		raise OwnershipError, "cannot remove a relation between two objects we don't own"
-	    end
+                raise OwnershipError, "cannot remove a relation between two objects we don't own"
+            end
 
             relations.each do |rel|
-                if name = rel.child_name
-                    parent.send("removing_#{rel.child_name}", child)
-                    child.send("removing_#{rel.child_name}_parent", parent)
+                if (name = rel.child_name)
+                    parent.send("removing_#{name}", child)
+                    child.send("removing_#{name}_parent", parent)
                 end
             end
 
             for trsc in transactions
                 next unless trsc.proxying?
                 if (parent_proxy = trsc[parent, create: false]) && (child_proxy = trsc[child, create: false])
-                    trsc.removing_plan_relation(parent_proxy, child_proxy, relations) 
+                    trsc.removing_plan_relation(parent_proxy, child_proxy, relations)
                 end
             end
         end
 
+        # @api private
+        #
         # Hook called after an edge has been removed from this plan
         #
         # @param [Object] parent the child object
@@ -249,9 +292,9 @@ module Roby
         #   has been removed
         def removed_edge(parent, child, relations)
             relations.each do |rel|
-                if name = rel.child_name
-                    parent.send("removed_#{rel.child_name}", child)
-                    child.send("removed_#{rel.child_name}_parent", parent)
+                if (name = rel.child_name)
+                    parent.send("removed_#{name}", child)
+                    child.send("removed_#{name}_parent", parent)
                 end
             end
 
@@ -259,10 +302,12 @@ module Roby
         end
 
         # @api private
+        #
+        # Helper for {#updating_edge_info} and {#updated_edge_info}
         def emit_relation_change_hook(parent, child, rel, *args, prefix: nil)
-            if name = rel.child_name
-                parent.send("#{prefix}_#{rel.child_name}", child, *args)
-                child.send("#{prefix}_#{rel.child_name}_parent", parent, *args)
+            if (name = rel.child_name)
+                parent.send("#{prefix}_#{name}", child, *args)
+                child.send("#{prefix}_#{name}_parent", parent, *args)
             end
         end
 
@@ -273,8 +318,8 @@ module Roby
         # It is a helper for {#merged_plan}
         def emit_relation_graph_merge_hooks(graph, prefix: nil)
             rel = graph.class
-            if rel.child_name
-                added_child_hook  = "#{prefix}_#{rel.child_name}"
+            if (name = rel.child_name)
+                added_child_hook  = "#{prefix}_#{name}"
                 added_parent_hook = "#{added_child_hook}_parent"
                 graph.each_edge do |parent, child, info|
                     parent.send(added_child_hook, child, info)
@@ -292,8 +337,8 @@ module Roby
             list.each do |graph, parent, child, *args|
                 if !hooks.has_key?(graph)
                     rel = graph.class
-                    if rel.child_name
-                        parent_hook = "#{prefix}_#{rel.child_name}"
+                    if (name = rel.child_name)
+                        parent_hook = "#{prefix}_#{name}"
                         child_hook  = "#{parent_hook}_parent"
                         hooks[graph] = [parent_hook, child_hook]
                     else
@@ -314,6 +359,14 @@ module Roby
         # Applies modification information extracted from a transaction. This is
         # used by {Transaction#commit_transaction}
         def merge_transaction(transaction, merged_graphs, added, removed, updated)
+            added.each do |_, parent, child, _|
+                if parent.garbage?
+                    raise ReusingGarbage, "attempting to reuse #{parent} which is marked as garbage"
+                elsif child.garbage?
+                    raise ReusingGarbage, "attempting to reuse #{child} which is marked as garbage"
+                end
+            end
+
             emit_relation_graph_transaction_application_hooks(added, prefix: 'adding')
             emit_relation_graph_transaction_application_hooks(removed, prefix: 'removing')
             emit_relation_graph_transaction_application_hooks(updated, prefix: 'updating')
@@ -343,6 +396,9 @@ module Roby
             end
         end
 
+        # @api private
+        #
+        # Emits the adding_* hooks when a plan gets merged in self
         def merging_plan(plan)
             plan.each_task_relation_graph do |graph|
                 emit_relation_graph_merge_hooks(graph, prefix: 'adding')
@@ -353,6 +409,9 @@ module Roby
             super
         end
 
+        # @api private
+        #
+        # Emits the added_* hooks when a plan gets merged in self
         def merged_plan(plan)
             if !plan.event_relation_graph_for(EventStructure::Precedence).empty?
                 execution_engine.event_ordering.clear
@@ -370,57 +429,116 @@ module Roby
             log(:merged_plan, droby_id, plan)
         end
 
-	# Hook called when a task is marked as garbage
+        # @api private
+        #
+        # Called to handle a task that should be garbage-collected
+        #
+        # What actually happens to the task is controlled by
+        # {PlanObject#can_finalize?}.
+        #
+        # If the task can be finalized, it is removed from the plan, after
+        # having triggered all relevant log events/hooks.
+        #
+        # Otherwise, it is isolated from the rest of the plan. Its relations and
+        # the relations of its events are cleared and the task is left in the
+        # plan. In the latter case, the task is marked as non-reusable.
+        #
+        # Always check {Task#reusable?} before using a task present in an
+        # {ExecutablePlan} in a new structure.
+        #
+        # @param [Task] task the task that is being garbage-collected
+        # @return [Boolean] true if the plan got modified, and false otherwise.
+        #   In practice, it will return false only if the task cannot be
+        #   finalized *and* has external relations.
         def garbage_task(task)
-            task.each_event do |ev|
-                for signalling_event in ev.parent_objects(EventStructure::Signal).to_a
-                    signalling_event.remove_signal ev
-                end
+            log(:garbage_task, droby_id, task, task.can_finalize?)
+
+            if task.can_finalize?
+                remove_task(task)
+                true
+            else
+                task.garbage!
+                task.clear_relations(remove_internal: false, remove_strong: false)
             end
-            log(:garbage_task, droby_id, task)
-            remove_task(task)
         end
 
-	# Hook called when an event is marked as garbage
+        # Called to handle a free event that should be garbage-collected
+        #
+        # What actually happens to the event is controlled by
+        # {PlanObject#can_finalize?}. If the event can be finalized, it is (i.e.
+        # removed from the plan, after having triggered all relevant log
+        # events/hooks). Otherwise, its relations are cleared and the task is
+        # left in the plan
+        #
+        # @return [Boolean] true if the plan got modified, and false otherwise.
+        #   In practice, it will return false only for events that had no
+        #   relations and that cannot be finalized.
         def garbage_event(event)
             log(:garbage_event, droby_id, event)
-            remove_free_event(event)
+            if event.can_finalize?
+                remove_free_event(event)
+                true
+            else
+                event.clear_relations(remove_strong: false)
+            end
         end
 
         include Roby::ExceptionHandlingObject
 
-        attr_reader :exception_handlers
-        def each_exception_handler(&iterator); exception_handlers.each(&iterator) end
+        # Iterate over the plan-wide exception handlers
+        #
+        # @yieldparam [#===] matcher an object that allows to match an
+        #   {ExecutionException}
+        # @yieldparam [#call] handler the exception handler, which will be
+        #   called with the plan and the {ExecutionException} object as argument
+        def each_exception_handler(&block)
+            exception_handlers.each(&block)
+        end
+
+        # Register a new exception handler
+        #
+        # @param [#===,#to_execution_exception_matcher] matcher
+        #   an object that matches exceptions for which the handler should be
+        #   called. Exception classes can be used directly. If more advanced
+        #   matching is needed, use .match to convert an exception class into
+        #   {Queries::LocalizedErrorMatcher} or one of its subclasses.
+        #
+        # @yieldparam [ExecutablePlan] plan the plan in which the exception
+        #   happened
+        # @yieldparam [ExecutionException] exception the exception that is being handled
         def on_exception(matcher, &handler)
             check_arity(handler, 2)
             exception_handlers.unshift [matcher.to_execution_exception_matcher, handler]
         end
 
+        # Actually remove a task from the plan
         def remove_task(object, timestamp = nil)
             if object.respond_to?(:running?) && object.running? && object.self_owned?
-                raise ArgumentError, "attempting to remove a running task from an executable plan"
+                raise ArgumentError, "attempting to remove #{object}, which is a running task, from an executable plan"
             end
 
             super
-	    @force_gc.delete(object)
-            @gc_quarantine.delete(object)
+            @force_gc.delete(object)
         end
 
+        # Clear the plan
         def clear
             super
             @force_gc.clear
-            @gc_quarantine.clear
         end
 
-	# Replace +task+ with a fresh copy of itself and start it.
+        # Replace +task+ with a fresh copy of itself and start it.
         #
         # See #recreate for details about the new task.
-	def respawn(task)
+        def respawn(task)
             new = recreate(task)
             execution_engine.once { new.start!(nil) }
-	    new
-	end
+            new
+        end
 
+        # @api private
+        #
+        # Called by {ExecutionEngine} to verify the plan's internal structure
         def call_structure_check_handler(handler)
             super
         rescue Exception => e
@@ -428,4 +546,3 @@ module Roby
         end
     end
 end
-

@@ -17,6 +17,11 @@ module Roby
                 instance_for(model.root).task
             end
 
+            # The plan this coordination object is part of
+            def plan
+                root_task.plan
+            end
+
             # The set of arguments given to this execution context
             # @return [Hash]
             attr_reader :arguments
@@ -62,11 +67,14 @@ module Roby
                         instance_for(model.root),
                         root_task,
                         on_replace: options[:on_replace])
+                    root_task.add_coordination_object(self)
 
                     attach_fault_response_tables_to(root_task)
                     
                     if options[:on_replace] == :copy
                         root_task.as_service.on_replacement do |old_task, new_task|
+                            old_task.remove_coordination_object(self)
+                            new_task.add_coordination_object(self)
                             attach_fault_response_tables_to(new_task)
                         end
                     end

@@ -16,43 +16,66 @@ module Roby
             # @param [DRobyChannel] io a channel to the server
             # @param [Interface] interface the interface object we give remote
             #   access to
-            def initialize(io, interface)
+            def initialize(io, interface, main_thread: Thread.current)
                 @notifications_enabled = true
-                @io, @interface = io, interface
+                @io = io
+                @interface = interface
+                @main_thread = main_thread
+                @pending_packets = Queue.new
+                @performed_handshake = false
+            end
 
-                interface.on_cycle_end do
-                    begin
-                        io.write_packet([:cycle_end, interface.execution_engine.cycle_index, interface.execution_engine.cycle_start])
-                    rescue ComError
-                        # The disconnection is going to be handled by the caller
-                        # of #poll
-                    end
+            # Listen to notifications on the underlying interface
+            def listen_to_notifications
+                listeners = []
+                listeners << @interface.on_cycle_end do
+                    write_packet(
+                        [
+                            :cycle_end,
+                            @interface.execution_engine.cycle_index,
+                            @interface.execution_engine.cycle_start
+                        ], defer_exceptions: true)
                 end
-                interface.on_notification do |*args|
+                listeners << @interface.on_notification do |*args|
                     if notifications_enabled?
-                        begin
-                            io.write_packet([:notification, *args])
-                        rescue ComError
-                            # The disconnection is going to be handled by the caller
-                            # of #poll
-                        end
+                        queue_packet([:notification, *args])
+                    elsif Thread.current == @main_thread
+                        flush_pending_packets
                     end
                 end
-                interface.on_job_notification do |*args|
-                    begin
-                        io.write_packet([:job_progress, *args])
-                    rescue ComError
-                        # The disconnection is going to be handled by the caller
-                        # of #poll
-                    end
+                listeners << @interface.on_ui_event do |*args|
+                    queue_packet([:ui_event, *args])
                 end
-                interface.on_exception do |*args|
-                    begin
-                        io.write_packet([:exception, *args])
-                    rescue ComError
-                        # The disconnection is going to be handled by the caller
-                        # of #poll
-                    end
+                listeners << @interface.on_job_notification do |*args|
+                    write_packet([:job_progress, *args], defer_exceptions: true)
+                end
+                listeners << @interface.on_exception do |*args|
+                    write_packet([:exception, *args], defer_exceptions: true)
+                end
+                @listeners = Roby.disposable(*listeners)
+            end
+
+            # Write or queue a call, depending on whether the current thread is the main
+            # thread
+            #
+            # Time ordering between out-of-thread and in-thread packets is not
+            # guaranteed, so this can only be used in cases where it does not matter.
+            def queue_packet(call)
+                if Thread.current == @main_thread
+                    write_packet(call, defer_exceptions: true)
+                else
+                    @pending_packets << call
+                end
+            end
+
+            # Flush packets queued from {#queue_packet}
+            def flush_pending_packets
+                packets = []
+                until @pending_packets.empty?
+                    packets << @pending_packets.pop
+                end
+                packets.each do |p|
+                    write_packet(p, defer_exceptions: true)
                 end
             end
 
@@ -60,14 +83,24 @@ module Roby
                 io.to_io
             end
 
-            def handshake(id)
+            def handshake(id, commands)
                 @client_id = id
                 Roby::Interface.info "new interface client: #{id}"
-                return interface.actions, interface.commands
+                result = commands.each_with_object(Hash.new) do |s, result|
+                    result[s] = interface.send(s)
+                end
+                @performed_handshake = true
+                listen_to_notifications
+                result
+            end
+
+            # Whether the remote side already called {#handshake?}
+            def performed_handshake?
+                @performed_handshake
             end
 
             def enable_notifications
-                self.notifications_enabled = false
+                self.notifications_enabled = true
             end
 
             def disable_notifications
@@ -80,39 +113,72 @@ module Roby
 
             def close
                 io.close
+                @listeners.dispose if @listeners
             end
 
-            def process_call(path, m, *args)
-                if path.empty? && respond_to?(m)
-                    send(m, *args)
+            def process_batch(path, calls)
+                calls.map do |p, m, *a|
+                    process_call(path + p, m, *a)
+                end
+            end
+
+            def process_call(path, name, *args)
+                if path.empty? && respond_to?(name)
+                    send(name, *args)
                 else
                     receiver = path.inject(interface) do |obj, subcommand|
                         obj.send(subcommand)
                     end
-                    receiver.send(m, *args)
+                    receiver.send(name, *args)
+                end
+            end
+
+            def has_deferred_exception?
+                @deferred_exception
+            end
+
+            def write_packet(call, defer_exceptions: false)
+                return if has_deferred_exception?
+
+                flush_pending_packets
+                io.write_packet(call)
+            rescue Exception => e
+                if defer_exceptions
+                    @deferred_exception = e
+                else raise
                 end
             end
 
             # Process one command from the client, and send the reply
             def poll
-                path, m, *args = io.read_packet
-                return if !m
+                raise @deferred_exception if has_deferred_exception?
 
-                if m == :process_batch
-                    reply = Array.new
-                    args.first.each do |p, m, *a|
-                        reply << process_call(path + p, m, *a)
-                    end
-                else
-                    reply = process_call(path, m, *args)
+                path, m, *args = io.read_packet
+                return unless m
+
+                begin
+                    reply =
+                        if m == :process_batch
+                            process_batch(path, args.first)
+                        else
+                            process_call(path, m, *args)
+                        end
+
+                    true
+                rescue Exception => e
+                    write_packet([:bad_call, e])
+                    return
                 end
-                io.write_packet([:reply, reply])
-            rescue ComError
-                raise
-            rescue Exception => e
-                io.write_packet([:bad_call, e])
+
+                begin
+                    write_packet([:reply, reply])
+                rescue ComError
+                    raise
+                rescue Exception => e
+                    write_packet([:protocol_error, e])
+                    raise
+                end
             end
         end
     end
 end
-

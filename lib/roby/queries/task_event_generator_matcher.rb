@@ -63,9 +63,11 @@ module Roby
             # @param [TaskEventGenerator] object
             # @return [Boolean]
             def ===(object)
+                return if !object.kind_of?(TaskEventGenerator)
+
                 if match_not_generalized(object)
                     true
-                elsif generalized?
+                elsif generalized? && object.plan
                     forwarding_graph = object.relation_graph_for(EventStructure::Forwarding)
                     forwarding_graph.depth_first_visit(object) do |generator|
                         return true if match_not_generalized(generator)

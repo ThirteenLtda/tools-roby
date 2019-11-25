@@ -11,7 +11,7 @@ module Robot
     def self.action_from_model(model)
         return Roby.app.action_from_model(model)
     end
-    
+
     # @deprecated use Roby.app.find_action_from_name instead
     def self.find_action_from_name(name)
         return Roby.app.find_action_from_name(name)
@@ -27,7 +27,7 @@ module Robot
         if plan != Roby.app.plan
             raise ArgumentError, "cannot call prepare_action with any other plan than Roby.app.plan"
         end
-	return Roby.app.prepare_action(name, **arguments)
+        return Roby.app.prepare_action(name, **arguments)
     end
 
     # Implements that one can call
@@ -39,52 +39,61 @@ module Robot
     #
     # See also Robot.prepare_action
     def self.method_missing(name, *args)
-	if name.to_s =~ /!$/
-	    name = $`.to_sym
-	else
-	    super
-	end
+        if name.to_s =~ /!$/
+            name = $`.to_sym
+        else
+            super
+        end
 
-	if args.size > 1
-	    raise ArgumentError, "wrong number of arguments (#{args.size} for 1) in #{name}!"
-	end
+        if args.size > 1
+            raise ArgumentError, "wrong number of arguments (#{args.size} for 1) in #{name}!"
+        end
 
-	options = args.first || {}
-	task, planner = Roby.app.prepare_action(name, **options)
+        options = args.first || {}
+        task, planner = Roby.app.prepare_action(name, job_id: Roby::Interface::Job.allocate_job_id, **options)
         task.plan.add_mission_task(task)
-	return task, planner
+        return task, planner
+    end
+
+    # Declare the robot type of the robot configuration being loaded
+    #
+    # Place this on top of the robot file in config/robots/
+    def self.robot_type(robot_type)
+        # Declare it first
+        Roby.app.robots.declare_robot_type(Roby.app.robot_name, robot_type)
+        # And then set it up
+        Roby.app.robot(Roby.app.robot_name, robot_type)
     end
 
     def self.init(&block)
-        Roby.app.on_init(&block)
+        Roby.app.on_init(user: true, &block)
     end
 
     def self.setup(&block)
-        Roby.app.on_setup(&block)
+        Roby.app.on_setup(user: true, &block)
     end
 
     def self.requires(&block)
-        Roby.app.on_require(&block)
+        Roby.app.on_require(user: true, &block)
     end
 
     def self.clear_models(&block)
-        Roby.app.on_clear_models(&block)
+        Roby.app.on_clear_models(user: true, &block)
     end
 
     def self.cleanup(&block)
-        Roby.app.on_cleanup(&block)
+        Roby.app.on_cleanup(user: true, &block)
     end
 
     def self.config(&block)
-        Roby.app.on_config(&block)
+        Roby.app.on_config(user: true, &block)
     end
 
     def self.controller(&block)
-        Roby.app.controller(&block)
+        Roby.app.controller(user: true, &block)
     end
 
     def self.actions(&block)
-        Roby.app.actions(&block)
+        Roby.app.actions(user: true, &block)
     end
 end
-

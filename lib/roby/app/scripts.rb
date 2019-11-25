@@ -18,13 +18,14 @@ module Roby
                 attr_reader :app
                 attr_reader :host
 
-                def initialize(app = Roby.app)
+                def initialize(app = Roby.app,
+                               default_host: app.shell_interface_host || 'localhost',
+                               default_port: app.shell_interface_port || Interface::DEFAULT_PORT)
                     @app = app
-                    @host_options = Hash.new
+                    @host_options = Hash[host: default_host, port: default_port]
                 end
 
                 def setup_option_parser(parser)
-                    @host_options = Hash.new
                     Roby::Application.host_options(parser, @host_options)
                 end
 
@@ -35,27 +36,8 @@ module Roby
                     parser
                 end
 
-                def with_setup
-                    app.base_setup
-                    yield
-                end
-
                 def host
-                    remote_url = @host_options[:host] || app.droby['host'] || 'localhost'
-                    if remote_url !~ /:\d+$/
-                        if app.droby['host'] && app.droby['host'] =~ /(:\d+)$/
-                            remote_url << $1
-                        else
-                            remote_url << ":#{Roby::Interface::DEFAULT_PORT}"
-                        end
-                    end
-
-                    match = /(.*):(\d+)$/.match(remote_url)
-                    if !match
-                        raise ArgumentError, "malformed URL #{remote_url}"
-                    end
-
-                    return match[1], Integer(match[2])
+                    return *@host_options.values_at(:host, :port)
                 end
 
                 def run(*args, banner: "",
@@ -64,13 +46,12 @@ module Roby
                     app.guess_app_dir
                     app.shell
                     app.single
+                    app.load_base_config
 
                     args = option_parser.parse(args)
-                    with_setup do
-                        host, port = self.host
-                        interface = Roby::Interface.connect_with_tcp_to(host, port)
-                        yield(interface)
-                    end
+                    host, port = self.host
+                    interface = Roby::Interface.connect_with_tcp_to(host, port)
+                    yield(interface)
                 end
 
                 def self.run(*args, banner: '', &block)

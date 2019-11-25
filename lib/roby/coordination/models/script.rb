@@ -13,17 +13,20 @@ module Roby
                     attr_reader :task
                     attr_reader :dependency_options
 
-                    def initialize(task, dependency_options)
+                    attr_predicate :explicit_start?, true
+
+                    def initialize(task, explicit_start: false, **dependency_options)
+                        @explicit_start = explicit_start
                         @task = task
                         @dependency_options = dependency_options
                     end
 
                     def new(script)
-                        Start.new(script.instance_for(task), dependency_options)
+                        Start.new(script.instance_for(task), explicit_start: explicit_start?, **dependency_options)
                     end
 
                     def execute(script)
-                        script.start_task(task)
+                        script.start_task(task, explicit_start: explicit_start?)
                         true
                     end
 
@@ -52,11 +55,10 @@ module Roby
                     # @option options [Float] :timeout (nil) value for {#timeout}
                     # @option options [Time] :after (nil) value for
                     #   {#time_barrier}
-                    def initialize(event, options = Hash.new)
-                        options = Kernel.validate_options options, after: nil
+                    def initialize(event, after: nil)
                         @event = event
                         @done = false
-                        @time_barrier = options[:after]
+                        @time_barrier = after
                     end
 
                     def new(script)
@@ -64,7 +66,9 @@ module Roby
                     end
 
                     def execute(script)
-                        event = self.event.resolve
+                        event     = self.event.resolve
+                        plan      = script.plan
+                        root_task = script.root_task
 
                         if time_barrier
                             last_event = event.history.last
@@ -73,22 +77,29 @@ module Roby
                             end
                         end
 
-                        if event.task != script.root_task
-                            script.root_task.depends_on event.task, success: event.symbol
-                        else
-                            if event.unreachable?
-                                raise DeadInstruction.new(script.root_task), "#{self} is locked: #{event.unreachability_reason}"
-                            end
-                            event.if_unreachable(cancel_at_emission: true) do |reason, generator|
-                                if !disabled?
-                                    raise DeadInstruction.new(script.root_task), "#{self} is locked: #{reason}"
-                                end
+                        if event.unreachable?
+                            plan.add_error(DeadInstruction.new(script.root_task))
+                            return false
+                        end
+
+                        if event.task != root_task
+                            role_name = "wait_#{self.object_id}"
+                            current_roles = (root_task.depends_on?(event.task) && root_task.roles_of(event.task))
+                            root_task.depends_on event.task, success: nil, role: role_name
+                        end
+
+                        event.if_unreachable(cancel_at_emission: true) do |reason, generator|
+                            if !disabled?
+                                generator.plan.add_error(DeadInstruction.new(script.root_task))
                             end
                         end
 
                         event.on on_replace: :copy do |event|
                             if event.generator == self.event.resolve && !disabled?
                                 if !time_barrier || event.time > time_barrier
+                                    if role_name && (child = script.root_task.find_child_from_role(role_name))
+                                        script.root_task.remove_roles(child, role_name, remove_child_when_empty: !current_roles || !current_roles.empty?)
+                                    end
                                     cancel
                                     script.step
                                 end
@@ -96,6 +107,10 @@ module Roby
                         end
 
                         false
+                    end
+
+                    def waited_task_role
+                        "wait_#{object_id}"
                     end
 
                     def to_s; "wait(#{event})" end
@@ -181,9 +196,9 @@ module Roby
                 #   calling {Base#task} on the relevant object
                 # @param [Hash] options the dependency relation options. See
                 #   {Roby::TaskStructure::Dependency::Extension#depends_on}
-                def start(task, options = Hash.new)
+                def start(task, explicit_start: false, **options)
                     task = validate_or_create_task task
-                    add Start.new(task, options)
+                    add Start.new(task, explicit_start: explicit_start, **options)
                     wait(task.start_event)
                 end
 
@@ -204,7 +219,7 @@ module Roby
                 # @param [Float] time the amount of time to wait, in seconds
                 def sleep(time)
                     task = self.task(ActionCoordination::TaskFromAsPlan.new(Tasks::Timeout.with_arguments(delay: time), Tasks::Timeout))
-                    start task
+                    start task, explicit_start: true
                     wait task.stop_event
                 end
 
@@ -215,17 +230,14 @@ module Roby
                 #
                 # @param [Event] event the event to wait for
                 # @param [Hash] options
-                # @option options [Float] timeout a timeout (for backward
+                # @param [Float] timeout a timeout (for backward
                 #   compatibility, use timeout(seconds) do ... end instead)
-                def wait(event, options = Hash.new)
+                def wait(event, timeout: nil, **wait_options)
                     validate_event event
 
-                    # For backward compatibility only
-                    options, wait_options = Kernel.filter_options(options, timeout: nil)
-
-                    wait = Wait.new(event, wait_options)
-                    if options[:timeout]
-                        timeout(options[:timeout]) do
+                    wait = Wait.new(event, **wait_options)
+                    if timeout
+                        timeout(timeout) do
                             add wait
                         end
                     else

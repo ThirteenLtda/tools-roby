@@ -59,10 +59,15 @@ module Roby
                 @current_cycle = Array.new
                 @sync = true
                 @dump_time = 0
+                @mutex = Mutex.new
                 if queue_size > 0
                     @dump_queue  = SizedQueue.new(queue_size)
                     @dump_thread = Thread.new(&method(:dump_loop))
                 end
+            end
+
+            def synchronize(&block)
+                @mutex.synchronize(&block)
             end
 
             def log_queue_size
@@ -98,57 +103,74 @@ module Roby
                 logfile.close
             end
 
+            def append_message(m, time, args)
+                if m == :merged_plan
+                    plan_id, merged_plan = *args
+
+                    merged_plan.tasks.each do |t|
+                        object_manager.register_object(t)
+                    end
+                    merged_plan.free_events.each do |e|
+                        object_manager.register_object(e)
+                    end
+                    merged_plan.task_events.each do |e|
+                        object_manager.register_object(e)
+                    end
+                    args = [plan_id, merged_plan.droby_dump(marshal)]
+                elsif m == :finalized_task
+                    task = args[1]
+                    args = marshal.dump(args)
+                    object_manager.deregister_object(task)
+                elsif m == :finalized_event
+                    event = args[1]
+                    args = marshal.dump(args)
+                    object_manager.deregister_object(event)
+                else
+                    args = marshal.dump(args)
+                end
+
+                @current_cycle << m << time.tv_sec << time.tv_usec << args
+            end
+
+            def dump_timepoint(event, time, args)
+                return if stats_mode?
+
+                synchronize do
+                    @current_cycle << event << time.tv_sec << time.tv_usec << args
+                end
+            end
+
             # Dump one log message
             def dump(m, time, args)
+                return if stats_mode?
+
                 start = Time.now
-                if stats_mode? && m == :cycle_end
-                    current_cycle << m << time.tv_sec << time.tv_usec << args
-                else
-                    if m == :merged_plan
-                        plan_id, merged_plan = *args
+                synchronize do
+                    append_message(m, time, args)
+                end
+            ensure @dump_time += (Time.now - start)
+            end
 
-                        merged_plan.tasks.each do |t|
-                            object_manager.register_object(t)
-                        end
-                        merged_plan.free_events.each do |e|
-                            object_manager.register_object(e)
-                        end
-                        merged_plan.task_events.each do |e|
-                            object_manager.register_object(e)
-                        end
-                        args = [plan_id, merged_plan.droby_dump(marshal)]
-                    elsif m == :finalized_task
-                        task = args[1]
-                        args = marshal.dump(args)
-                        object_manager.deregister_object(task)
-                    elsif m == :finalized_event
-                        event = args[1]
-                        args = marshal.dump(args)
-                        object_manager.deregister_object(event)
-                    else
-                        args = marshal.dump(args)
+            def flush_cycle(*last_message)
+                start = Time.now
+                if threaded?
+                    if !@dump_thread.alive?
+                        @dump_thread.value
                     end
 
-                    current_cycle << m << time.tv_sec << time.tv_usec << args
-                end
-
-                if m == :cycle_end
-                    if threaded?
-                        if !@dump_thread.alive?
-                            @dump_thread.value
-                        end
-
-                        @dump_queue << current_cycle
+                    synchronize do
+                        append_message(*last_message)
+                        @dump_queue << @current_cycle
                         @current_cycle = Array.new
-                    else
-                        logfile.dump(current_cycle)
-                        if sync?
-                            logfile.flush
-                        end
-                        current_cycle.clear
                     end
+                else
+                    append_message(*last_message)
+                    logfile.dump(@current_cycle)
+                    if sync?
+                        logfile.flush
+                    end
+                    @current_cycle.clear
                 end
-
             ensure @dump_time += (Time.now - start)
             end
 

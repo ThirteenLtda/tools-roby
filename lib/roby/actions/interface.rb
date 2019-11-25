@@ -15,7 +15,6 @@ module Roby
         #     end
         class Interface
             extend Models::Interface
-            extend MetaRuby::ModelAsClass
             extend Logger::Hierarchy
 
             # The plan to which this action interface adds tasks
@@ -28,15 +27,17 @@ module Roby
             def model; self.class end
 
             def action_state_machine(task, &block)
-                model = Coordination::ActionStateMachine.new_submodel(action_interface: self.model, root: task.model)
+                model = Coordination::ActionStateMachine.
+                    new_submodel(action_interface: self.model, root: task.model)
                 model.parse(&block)
-                model.new(self.model, task)
+                model.new(task)
             end
 
             def action_script(task, &block)
-                model = Coordination::ActionScript.new_submodel(action_interface: self.model, root: task.model)
+                model = Coordination::ActionScript.
+                    new_submodel(action_interface: self.model, root: task.model)
                 model.parse(&block)
-                model.new(self.model, task)
+                model.new(task)
             end
         end
     end
