@@ -73,18 +73,51 @@ module Roby
             # @return Action
             def describe(doc = nil)
                 if @current_description
-                    Actions::Interface.warn "the last #describe call was not followed by an action definition. Did you forget to add a method to your action interface ?"
+                    Actions::Interface.warn(
+                        'the last #describe call was not followed by an action '\
+                        'definition. Did you forget to add a method to your '\
+                        'action interface ?'
+                    )
                 end
                 @current_description = Models::Action.new(doc)
             end
 
-            # Registers a new action on this model
+            # Registers an action on this model
+            #
+            # This is used to selectively reuse an action from a different
+            # action interface, for instance:
+            #
+            #     class Navigation < Roby::Actions::Interface
+            #         action_state_machine 'go_to' do
+            #         end
+            #     end
+            #
+            #     class UI < Roby::Actions::Interface
+            #         register_action 'go_to', Navigation.go_to.model
+            #     end
+            #
+            def register_action(name, action_model)
+                unless action_model.respond_to?(:to_action_model)
+                    raise ArgumentError, 'register_action expects an action model, '\
+                                         "got #{action_model.class} instead"
+                end
+
+                # Copy is performed to avoid changing the original models and
+                # really only share the action to another interface
+                action_model = action_model.to_action_model.dup
+                register_action!(name, action_model)
+                action_model
+            end
+
+            # @api private
+            #
+            # Internal, no-check version of {#register_action}
             #
             # If no specific return type has been specified, one is created
             # automatically and registered as a constant on this action
             # interface. For instance, the start_all_devices action would create
             # a simple StartAllDevices task model.
-            def register_action(name, action_model)
+            def register_action!(name, action_model)
                 name = name.to_s
                 create_default_action_return_type(name, action_model)
                 action_model.name = name
@@ -141,7 +174,7 @@ module Roby
                             raise ArgumentCountMismatch, "action #{name} has been declared to have arguments, the #{name} method must be callable with a single Hash argument"
                         end
                     end
-                    register_action(name, description)
+                    register_action!(name, description)
                 end
             end
 
@@ -186,12 +219,17 @@ module Roby
                 end
             end
 
+            # @api private
+            #
+            # Create an action that will instanciate a coordination model
+            #
+            # @return [(CoordinationAction,Action)]
             def create_and_register_coordination_action(name, coordination_class, action_model: require_current_description, &block)
                 name = name.to_s
                 create_default_action_return_type(name, action_model)
                 action_model, coordination_model =
                     create_coordination_action(action_model, coordination_class, &block)
-                register_action(name, action_model)
+                register_action!(name, action_model)
                 coordination_model.name = name
 
                 define_method(name) do |**arguments|
@@ -229,7 +267,7 @@ module Roby
             #
             # @param [String] name the name of the new action
             # @yield the action state machine definition
-            # @return [Action,Coordination::Models::ActionStateMachine]
+            # @return [(CoordinationAction,ActionStateMachine)]
             #
             # The action state machine model can later be retrieved using
             # {Action#coordination_model}
